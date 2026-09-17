@@ -2,7 +2,7 @@
 
 **A kill switch for LLM agents that doesn't destroy the evidence.**
 
-> **Status: contract suite green; runnable.** The design is settled and all 182 tests
+> **Status: contract suite green; runnable.** The design is settled and all 253 tests
 > pass — the domain, the gate, the judge tiering, the reaper, the HTTP surface, persistence
 > (`SqliteRepository`, `Settings.from_env`), and the worker SDK are all implemented against
 > the spec-first contract. See [Project status](#project-status) and
@@ -199,9 +199,9 @@ still sees it.
 ## Project status
 
 The design is documented, the decisions behind it are recorded, and the contract is
-encoded as a test suite. All 182 tests pass. They were written from the spec before any
-implementation existed, so building against them couldn't quietly redefine what the
-system is supposed to do — the domain model, the gate, the LLM judge tiering, the
+encoded as a test suite. All 253 tests pass — 147 of them the spec-first contract, written
+before any implementation existed, so building against them couldn't quietly redefine what
+the system is supposed to do — the domain model, the gate, the LLM judge tiering, the
 heartbeat reaper, the HTTP surface (both the worker protocol and the human-only operator
 endpoints), persistence, and the worker SDK are all implemented and green.
 
