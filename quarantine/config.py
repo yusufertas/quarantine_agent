@@ -57,6 +57,21 @@ class Settings:
                 f"got {judge_background_every!r} (the gate divides by it)"
             )
 
+        judge_trajectory_events = integer(
+            "JUDGE_TRAJECTORY_EVENTS", defaults.judge_trajectory_events
+        )
+        if judge_trajectory_events <= 0:
+            # Rejected here rather than absorbed downstream, because the two
+            # non-positive values fail in opposite and equally silent ways:
+            # SQLite reads `LIMIT 0` as an empty trajectory (a judge asked to
+            # assess nothing, which it will happily call CLEAR) and a negative
+            # LIMIT as unlimited (the whole run's history, at whatever cost).
+            raise ValueError(
+                "QUARANTINE_JUDGE_TRAJECTORY_EVENTS must be a positive integer, "
+                f"got {judge_trajectory_events!r} (0 hands the judge an empty "
+                "trajectory; a negative value hands it the entire run)"
+            )
+
         return cls(
             loop_repeats=integer("LOOP_REPEATS", defaults.loop_repeats),
             loop_window=integer("LOOP_WINDOW", defaults.loop_window),
@@ -72,9 +87,7 @@ class Settings:
                 source.get("QUARANTINE_JUDGE_TIMEOUT_SECONDS")
                 or defaults.judge_timeout_seconds
             ),
-            judge_trajectory_events=integer(
-                "JUDGE_TRAJECTORY_EVENTS", defaults.judge_trajectory_events
-            ),
+            judge_trajectory_events=judge_trajectory_events,
             judge_background_every=judge_background_every,
             operator_token=source.get("QUARANTINE_OPERATOR_TOKEN", defaults.operator_token),
             database_path=source.get("QUARANTINE_DATABASE_PATH", defaults.database_path),

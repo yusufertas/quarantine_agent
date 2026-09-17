@@ -45,8 +45,7 @@ class Reaper:
             updated, transition = machine.escalate(
                 run, cause="heartbeat_timeout", actor="system", now=now
             )
-            self._store.save_run(updated)
-            self._store.append_transition(transition)
+            self._store.record_state_change(updated, transition)
             escalated += 1
 
         return escalated

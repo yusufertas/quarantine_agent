@@ -37,12 +37,16 @@ def budget(ctx: RuleContext, settings: Settings) -> RuleVerdict | None:
 
 def loop(ctx: RuleContext, settings: Settings) -> RuleVerdict | None:
     """The same (tool, args) repeated within the recent window -- the stuck agent."""
-    window = ctx.recent_events[-settings.loop_window :]
-    signatures = [
-        (e.tool_name, e.args_digest)
-        for e in window
-        if e.kind is EventKind.PROPOSED and e.tool_name
+    # loop_window counts TOOL CALLS (PROPOSED events), not log rows. Every gate
+    # call writes 2-4 rows (PROPOSED, DECISION, and on some paths JUDGE and
+    # OUTCOME), so filtering to PROPOSED must happen BEFORE slicing the window --
+    # slicing rows first silently shrinks the window to a fraction of the calls
+    # it is meant to cover (see call_rate's history for the same defect).
+    proposals = [
+        e for e in ctx.recent_events if e.kind is EventKind.PROPOSED and e.tool_name
     ]
+    window = proposals[-settings.loop_window :]
+    signatures = [(e.tool_name, e.args_digest) for e in window]
     if ctx.call is not None:
         signatures.append((ctx.call.tool_name, ctx.call.args_digest))
     if not signatures:

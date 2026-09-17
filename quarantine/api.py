@@ -5,6 +5,13 @@ registered worker calls, and the operator endpoints, which require a human. Rele
 a FROZEN run is the operation that must never become automatic (ADR-0002).
 """
 
+# NO `from __future__ import annotations` IN THIS MODULE -- deliberately.
+# Under PEP 563 every annotation becomes a string that FastAPI resolves against
+# the module globals, and `Operator` is a closure local defined inside
+# create_app(). It would resolve to nothing, FastAPI would treat `actor` as an
+# ordinary query parameter, and all five operator routes would 422 instead of
+# authenticating. A lint-driven consistency pass adding it here breaks the
+# operator surface silently; tests/test_operator_surface.py is the tripwire.
 from collections.abc import Callable
 from dataclasses import replace
 from datetime import timedelta
@@ -18,7 +25,13 @@ from pydantic import BaseModel
 from .domain import machine
 from .domain.models import Event, Run, ToolCall, Transition
 from .domain.states import EventKind, RunState
-from .errors import AuthorizationRequired, IllegalTransition, RunTerminated, UnknownRun
+from .errors import (
+    AuthorizationRequired,
+    IllegalTransition,
+    RunTerminated,
+    StoreUnavailable,
+    UnknownRun,
+)
 from .gate import Gate
 
 
@@ -52,6 +65,14 @@ class TerminateRequest(BaseModel):
 
 
 def _run_dict(run: Run) -> dict:
+    """Serialize a run for the operator surface, budgets and deadline included.
+
+    The counters alone do not answer the question an operator actually arrives
+    with -- "why was this frozen?". `tokens_used: 104312` means nothing next to
+    `budget_tokens: 100000`, and a `wall_clock` escalation is unreadable without
+    `deadline_at`. The limits travel with the counters so the reason a rule fired
+    is legible from this payload alone, without a second lookup.
+    """
     return {
         "id": run.id,
         "agent_name": run.agent_name,
@@ -122,6 +143,14 @@ def create_app(
     def _unauthorized(_, exc):
         return JSONResponse(status_code=403, content={"detail": str(exc)})
 
+    # 503 rather than the 500 an unhandled exception would produce: spec §9 makes
+    # a store outage a tiering event, and the SDK can only tier client-side on a
+    # status that says "the control plane cannot decide right now" rather than
+    # "the control plane is broken".
+    @app.exception_handler(StoreUnavailable)
+    def _store_down(_, exc):
+        return JSONResponse(status_code=503, content={"detail": str(exc)})
+
     def operator(
         x_operator_token: Annotated[str | None, Header()] = None,
         x_operator_id: Annotated[str | None, Header()] = None,
@@ -173,6 +202,14 @@ def create_app(
 
     @app.post("/runs/{run_id}/outcome")
     def outcome(run_id: str, body: OutcomeRequest) -> dict:
+        """Record a tool result and advance the run's counters.
+
+        This is a read-modify-write of a snapshot, and deliberately safe as one:
+        `save_run` cannot write `state`, so an escalation landing between the read
+        and the write survives untouched. Before that constraint existed, a report
+        arriving a millisecond after a freeze wrote the pre-freeze state back and
+        un-contained the run while its transition row stayed on the record.
+        """
         run = store.get_run(run_id)
         now = clock.now()
         store.save_run(
@@ -203,6 +240,11 @@ def create_app(
 
     @app.post("/runs/{run_id}/heartbeat")
     def heartbeat(run_id: str) -> dict:
+        """Mark the worker alive. Liveness only -- never a state change.
+
+        Same property as `outcome`: `save_run` carries no `state`, so a heartbeat
+        cannot resurrect a run the machine has since contained.
+        """
         run = store.get_run(run_id)
         store.save_run(replace(run, last_heartbeat_at=clock.now()))
         return {"ok": True}
@@ -211,8 +253,7 @@ def create_app(
     def complete(run_id: str) -> dict:
         run = store.get_run(run_id)
         updated, transition = machine.complete(run, now=clock.now())
-        store.save_run(updated)
-        store.append_transition(transition)
+        store.record_state_change(updated, transition)
         return {"state": updated.state.value}
 
     # ---- operator surface (human actor required) -------------------------
@@ -235,13 +276,20 @@ def create_app(
         return [_event_dict(e) for e in store.recent_events(run_id, 1000)]
 
     @app.post("/runs/{run_id}/release")
-    def release(run_id: str, actor: Operator, body: ReleaseRequest) -> dict:
+    def release(
+        run_id: str, actor: Operator, body: ReleaseRequest = ReleaseRequest()
+    ) -> dict:
+        """Release a FROZEN run. An absent body means the documented default.
+
+        `body` carries a default instance so `POST /release` with no body at all
+        lands on `target=DEGRADED` -- documenting a default that only applies if
+        you remember to send `{}` is not a default.
+        """
         run = store.get_run(run_id)
         updated, transition = machine.release(
             run, target=body.target, actor=actor, now=clock.now(), detail=body.detail
         )
-        store.save_run(updated)
-        store.append_transition(transition)
+        store.record_state_change(updated, transition)
         return {"state": updated.state.value}
 
     @app.post("/runs/{run_id}/terminate")
@@ -250,8 +298,7 @@ def create_app(
         updated, transition = machine.terminate(
             run, actor=actor, now=clock.now(), detail=body.detail
         )
-        store.save_run(updated)
-        store.append_transition(transition)
+        store.record_state_change(updated, transition)
         return {"state": updated.state.value}
 
     return app

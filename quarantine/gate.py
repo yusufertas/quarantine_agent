@@ -149,9 +149,11 @@ class Gate:
         return None
 
     def _transition(self, outcome):
+        # One call, one transaction: the new state and its audit row land together
+        # or not at all, and nothing here can write a counter back from a stale
+        # snapshot (spec §4, invariant 4).
         run, transition = outcome
-        self._store.save_run(run)
-        self._store.append_transition(transition)
+        self._store.record_state_change(run, transition)
         return run
 
     def _record(self, run_id, now, call, decision: Decision) -> Decision:
@@ -187,9 +189,29 @@ class Gate:
             )
         )
 
+    # Every gate call writes at least two log rows -- PROPOSED and DECISION -- and
+    # commonly four, once the worker reports an OUTCOME and the judge appends a
+    # JUDGE row. Call this the events-per-call amplification.
+    #
+    # The rules think in TOOL CALLS; `recent_events` is measured in LOG ROWS. Without
+    # this factor a window of `call_rate_per_minute + 1` rows can never contain more
+    # than about a quarter that many PROPOSED events, so `call_rate` -- whose whole
+    # job is to fire above that threshold -- could not fire at any rate whatsoever.
+    # It looked like protection and provided none.
+    #
+    # Do NOT "simplify" the multiplier away: the window must be at least
+    # amplification x threshold rows for the detector to be able to see a breach.
+    # tests/test_detector_integration.py drives real gate calls end to end and fails
+    # if the ratio drifts again; a unit test over a hand-built context cannot.
+    _EVENTS_PER_CALL = 4
+
     def _history_limit(self) -> int:
         s = self._settings
-        return max(s.loop_window, s.judge_trajectory_events, s.call_rate_per_minute + 1)
+        return max(
+            s.loop_window,
+            s.judge_trajectory_events,
+            self._EVENTS_PER_CALL * (s.call_rate_per_minute + 1),
+        )
 
     def _maybe_judge_in_background(self, run_id: str) -> None:
         """Queue out-of-band judging every `judge_background_every` gate calls.

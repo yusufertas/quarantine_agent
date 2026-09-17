@@ -222,10 +222,40 @@ to operators on the inspection page. It reads the last `K=20` events (configurab
 | Escalated worker resumes calling | Receives the current state's decision. Liveness is not evidence of health; it does **not** restore. |
 | Judge timeout or error | `HIGH`: `DENY` (fail closed). `LOW`: logged, background judging skipped. |
 | Storage unavailable | Control plane cannot decide; returns `503`. Workers apply the same tiering client-side: `HIGH` blocked, `LOW` proceeds. |
-| Control plane unreachable from worker | SDK fails **closed** for `HIGH`-risk tools, **open** for `LOW`. Every such instance is reported as an event once connectivity returns. |
+| Control plane unreachable from worker | SDK fails **closed** for `HIGH`-risk tools, **open** for `LOW`. Offline instances are **not** replayed — see below. |
 
 Net effect of the tiering: an outage degrades every agent to safe mode rather than halting
 them or leaving them unguarded.
+
+**Storage failures are translated at the repository boundary.** `SqliteRepository` wraps
+`sqlite3` errors as `StoreUnavailable`, which the API maps to `503` — deliberately not the
+`500` an unhandled exception produces, because the worker tiers on the status and cannot
+tier on a bug. The `Transport` protocol correspondingly requires a `TransportError(status,
+detail)` for any non-2xx response: a transport that lets its HTTP library's own exception
+escape hands the client something it cannot classify, and the 5xx then crashes the agent
+instead of degrading it. A missing run stays `UnknownRun`/`404` and a constraint violation
+stays itself; neither is an outage.
+
+**Offline gate decisions are not replayed.** An earlier draft of this section promised that
+every instance of the SDK deciding offline would be "reported as an event once connectivity
+returns". It is not, and will not be — recorded here as a decision rather than left as an
+unimplemented promise, which is the worse of the two states.
+
+The reasoning: replay requires the SDK to hold durable local state across an outage of
+unbounded length. ADR-0001 defines that module as a thin convenience and explicitly **not**
+a trust boundary, and the control plane deliberately trusts nothing it reports. A buffer
+there would be a new, unbounded-growth failure mode in the worker — the component least
+able to absorb one — in exchange for telemetry the control plane cannot rely on anyway,
+since a bypassing worker would simply not send it.
+
+The consequence, stated plainly because an operator has to know it: **calls a worker made
+while the control plane was unreachable are absent from the trajectory that operator later
+reads.** A gap in the event log means "we could not see" and not "nothing happened". What
+still holds during an outage is the tiering (`HIGH` refused, `LOW` allowed) and the
+reaper's silence detection, which escalates the run without needing the worker's
+cooperation. If per-call attribution across an outage ever becomes a requirement, it
+belongs on the server — a `degraded_window` transition recorded when a run resumes — and
+not in a buffer on the worker.
 
 ## 10. Configuration
 

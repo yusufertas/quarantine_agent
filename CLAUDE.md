@@ -16,7 +16,7 @@ reasoning is not re-derivable from the code:
 - [`docs/adr/0002-graded-quarantine-ladder.md`](docs/adr/0002-graded-quarantine-ladder.md) — why quarantine is a ladder
 - [`docs/adr/0003-tier-llm-judge-by-tool-risk.md`](docs/adr/0003-tier-llm-judge-by-tool-risk.md) — why the judge is tiered
 
-**Status: contract suite green (182/182); runnable.** The domain, gate, judge tiering,
+**Status: contract suite green (253/253); runnable.** The domain, gate, judge tiering,
 reaper, HTTP surface (worker protocol + human-only operator endpoints), persistence
 (`SqliteRepository`, `Settings.from_env`), and the worker SDK are all implemented against
 the spec-first test suite. Real gaps that remain: nothing schedules `Reaper.sweep()` on a
@@ -78,8 +78,9 @@ python3 -m venv .venv && .venv/bin/pip install -e ".[dev]"   # setup
 QUARANTINE_OPERATOR_TOKEN=dev .venv/bin/uvicorn quarantine.main:build --factory # run the service
 ```
 
-The suite is now **green**: all 182 tests pass. Persistence (`SqliteRepository`,
-`Settings.from_env`) and the worker SDK are implemented, and the service starts via
+The suite is now **green**: all 253 tests pass, 147 of them the spec-first contract.
+Persistence (`SqliteRepository`, `Settings.from_env`) and the worker SDK are
+implemented, and the service starts via
 `quarantine.main:build` (not `quarantine.api:create_app`, which takes injected
 collaborators directly and bypasses the env wiring and operator-token check
 `main.build()` performs). Nothing in the current contract exercises code paths beyond

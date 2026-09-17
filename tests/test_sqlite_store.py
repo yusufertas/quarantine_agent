@@ -12,6 +12,7 @@ from datetime import timedelta
 import pytest
 
 from conftest import T0, make_event, make_run, make_transition
+from quarantine.domain import machine
 from quarantine.domain.states import EventKind, RunState
 from quarantine.errors import UnknownRun
 from quarantine.sqlite_store import SqliteRepository
@@ -37,11 +38,51 @@ class TestRuns:
         with pytest.raises(UnknownRun):
             repo.get_run("nope")
 
-    def test_save_updates_in_place(self, repo):
+    def test_save_updates_counters_in_place(self, repo):
         repo.create_run(make_run())
-        repo.save_run(make_run(state=RunState.FROZEN))
-        assert repo.get_run("run-1").state is RunState.FROZEN
+        repo.save_run(make_run(tokens_used=7, consecutive_errors=2))
+        loaded = repo.get_run("run-1")
+        assert (loaded.tokens_used, loaded.consecutive_errors) == (7, 2)
         assert len(repo.list_runs()) == 1
+
+    def test_save_cannot_write_state(self, repo):
+        """The storage-level enforcement of the machine-only-writer invariant.
+
+        Callers hold a snapshot; if `save_run` carried `state`, a counter update
+        racing an escalation would write the pre-escalation state back and leave
+        a run whose transition log says DEGRADED and whose state says HEALTHY.
+        """
+        repo.create_run(make_run(state=RunState.DEGRADED))
+        repo.save_run(make_run(state=RunState.HEALTHY, tokens_used=7))
+        loaded = repo.get_run("run-1")
+        assert loaded.state is RunState.DEGRADED
+        assert loaded.tokens_used == 7
+
+    def test_save_of_an_unknown_run_is_not_silently_lost(self, repo):
+        with pytest.raises(UnknownRun):
+            repo.save_run(make_run(run_id="never-registered"))
+
+    def test_record_state_change_writes_state_and_its_audit_row(self, repo):
+        repo.create_run(make_run(state=RunState.HEALTHY))
+        updated, transition = machine.escalate(
+            repo.get_run("run-1"), cause="loop", actor="system", now=T0
+        )
+        repo.record_state_change(updated, transition)
+        assert repo.get_run("run-1").state is RunState.DEGRADED
+        assert [t.cause for t in repo.transitions("run-1")] == ["loop"]
+
+    def test_record_state_change_leaves_counters_alone(self, repo):
+        """It takes `state` from the machine's output and nothing else, so an
+        escalation cannot clobber a concurrent outcome report."""
+        repo.create_run(make_run(state=RunState.HEALTHY))
+        repo.save_run(make_run(tokens_used=42, tool_calls=9))
+        stale, transition = machine.escalate(
+            make_run(state=RunState.HEALTHY), cause="loop", actor="system", now=T0
+        )
+        repo.record_state_change(stale, transition)
+        loaded = repo.get_run("run-1")
+        assert loaded.state is RunState.DEGRADED
+        assert (loaded.tokens_used, loaded.tool_calls) == (42, 9)
 
     def test_list_filters_by_state(self, repo):
         repo.create_run(make_run(run_id="a", state=RunState.HEALTHY))

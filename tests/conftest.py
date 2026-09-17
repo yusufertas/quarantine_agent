@@ -71,7 +71,16 @@ class InMemoryRepository:
             raise UnknownRun(run_id) from None
 
     def save_run(self, run: Run) -> None:
+        # Doubles as the tests' raw state-setter, which is why it still writes the
+        # whole value. SqliteRepository.save_run deliberately cannot write `state`
+        # (see its docstring); production code only ever reaches here with counters
+        # and a heartbeat, and `record_state_change` is the only state path.
         self.runs[run.id] = run
+
+    def record_state_change(self, run: Run, transition: Transition) -> None:
+        """Atomic in SQLite; here just the two writes, in order."""
+        self.runs[run.id] = run
+        self.transitions_log.append(transition)
 
     def list_runs(self, state: RunState | None = None) -> Sequence[Run]:
         runs = list(self.runs.values())
