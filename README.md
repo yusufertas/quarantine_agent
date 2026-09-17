@@ -2,9 +2,11 @@
 
 **A kill switch for LLM agents that doesn't destroy the evidence.**
 
-> **Status: skeleton and a failing test suite.** The design is settled, the package
-> structure exists, and 147 tests define the contract — but no behaviour is implemented
-> yet. See [Project status](#project-status).
+> **Status: contract suite green; not yet runnable.** The design is settled and all 154
+> tests pass — the domain, the gate, the judge tiering, the reaper, and the HTTP surface
+> are implemented against the spec-first contract. What's still missing: persistence
+> (`SqliteRepository`, `Settings.from_env`) and the worker SDK, so the service cannot
+> actually be started yet. See [Project status](#project-status).
 
 ---
 
@@ -93,9 +95,16 @@ registry quietly rots into a permit-list for anything new.
 ## Project status
 
 The design is documented, the decisions behind it are recorded, and the contract is
-encoded as a test suite. Every one of the 147 tests fails with `NotImplementedError` —
-that is the intended state, not a problem: the tests were written from the spec, so
-implementing against them cannot quietly redefine what the system is supposed to do.
+encoded as a test suite. All 154 tests pass. They were written from the spec before any
+implementation existed, so building against them couldn't quietly redefine what the
+system is supposed to do — the domain model, the gate, the LLM judge tiering, the
+heartbeat reaper, and the HTTP surface (both the worker protocol and the human-only
+operator endpoints) are all implemented and green.
+
+What's not built yet: **persistence** — `SqliteRepository` and `Settings.from_env` are
+still `NotImplementedError` — and the **worker SDK**. Until those land the service is
+demonstrably correct but cannot actually be started; it exists only against the
+in-memory test repository.
 
 ```bash
 python3 -m venv .venv && .venv/bin/pip install -e ".[dev]"

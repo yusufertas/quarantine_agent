@@ -16,9 +16,11 @@ reasoning is not re-derivable from the code:
 - [`docs/adr/0002-graded-quarantine-ladder.md`](docs/adr/0002-graded-quarantine-ladder.md) — why quarantine is a ladder
 - [`docs/adr/0003-tier-llm-judge-by-tool-risk.md`](docs/adr/0003-tier-llm-judge-by-tool-risk.md) — why the judge is tiered
 
-**Status: skeleton + failing test suite.** The package structure, types and signatures
-exist; behaviour does not. Implement against the tests — they are the contract, and they
-were written from the spec rather than from any implementation.
+**Status: contract suite green (154/154); not yet runnable.** The domain, gate, judge
+tiering, reaper, and HTTP surface (worker protocol + human-only operator endpoints) are
+all implemented against the spec-first test suite. Still unbuilt: persistence
+(`SqliteRepository` and `Settings.from_env` are `NotImplementedError`) and the worker
+SDK — so the service cannot actually be started yet.
 
 ## Architecture invariants
 
@@ -74,13 +76,10 @@ python3 -m venv .venv && .venv/bin/pip install -e ".[dev]"   # setup
 .venv/bin/uvicorn quarantine.api:create_app --factory --reload # run the service
 ```
 
-The suite is currently **red by design**: 147 tests define the contract and every
-failure is a `NotImplementedError` from the skeleton. A failure that is *not* a
-`NotImplementedError` means something is genuinely broken — check that first:
-
-```bash
-.venv/bin/python -m pytest --tb=line 2>&1 | grep -v NotImplementedError
-```
+The suite is now **green**: all 154 tests pass. Persistence and the worker SDK
+(`SqliteRepository`, `Settings.from_env`) remain `NotImplementedError` by design — that
+work is still ahead — but nothing in the current contract exercises them, so a failure
+anywhere else means something is genuinely broken.
 
 ## Tracker
 
