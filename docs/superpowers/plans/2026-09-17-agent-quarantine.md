@@ -87,7 +87,7 @@ Ordering is innermost-first: pure domain has no dependencies and goes green with
 
 **Files:**
 - Modify: `quarantine/domain/registry.py`
-- Test: `tests/test_registry.py` (exists, 12 tests, 10 failing)
+- Test: `tests/test_registry.py` (exists, 16 tests, 14 failing)
 
 **Interfaces:**
 - Consumes: `ToolRisk` from `quarantine.domain.states`; `TOOL_RISKS` already populated in the module.
@@ -99,7 +99,7 @@ Ordering is innermost-first: pure domain has no dependencies and goes green with
 .venv/bin/python -m pytest tests/test_registry.py -v
 ```
 
-Expected: 10 failures, each `NotImplementedError: registry.risk_of` or `registry.unclassified`. 2 pass (they only inspect `TOOL_RISKS`).
+Expected: 14 failures, each `NotImplementedError: registry.risk_of` or `registry.unclassified`. 2 pass (they only inspect `TOOL_RISKS`).
 
 - [ ] **Step 2: Implement**
 
@@ -129,7 +129,7 @@ Also fix the signature annotation on `unclassified` (the skeleton has `object` p
 .venv/bin/python -m pytest tests/test_registry.py -v
 ```
 
-Expected: 12 passed.
+Expected: 16 passed.
 
 - [ ] **Step 4: Commit**
 
@@ -153,7 +153,7 @@ inherit a LOW classification nobody approved."
 
 **Files:**
 - Modify: `quarantine/domain/machine.py`
-- Test: `tests/test_machine.py` (exists, 46 tests, all failing)
+- Test: `tests/test_machine.py` (exists, 45 tests, all failing)
 
 **Interfaces:**
 - Consumes: `RunState` from `domain.states`; `Run`, `Transition` from `domain.models`; `IllegalTransition`, `AuthorizationRequired` from `quarantine.errors`. The tables `ESCALATIONS`, `RELEASE_TARGETS`, `TERMINABLE_FROM` are already defined in the module.
@@ -173,7 +173,7 @@ inherit a LOW classification nobody approved."
 .venv/bin/python -m pytest tests/test_machine.py -v
 ```
 
-Expected: 46 failures, all `NotImplementedError`.
+Expected: 45 failures, all `NotImplementedError`.
 
 - [ ] **Step 2: Implement**
 
@@ -282,7 +282,7 @@ Note `_apply` stamps `state_since=now` on every transition. Auto-recovery measur
 .venv/bin/python -m pytest tests/test_machine.py -v
 ```
 
-Expected: 46 passed. The exhaustive test (`TestExhaustiveCoverage`, 16 parametrised cases) is the one that matters — it asserts every `(from, to)` pair is reachable exactly when the spec's table permits it.
+Expected: 45 passed. The exhaustive test (`TestExhaustiveCoverage`, 16 parametrised cases) is the one that matters — it asserts every `(from, to)` pair is reachable exactly when the spec's table permits it.
 
 - [ ] **Step 4: Commit**
 
@@ -306,7 +306,7 @@ silent no-op there reads as a successful escalation."
 
 **Files:**
 - Modify: `quarantine/domain/rules.py`
-- Test: `tests/test_rules.py` (exists, 21 tests, 20 failing)
+- Test: `tests/test_rules.py` (exists, 20 tests, 19 failing)
 
 **Interfaces:**
 - Consumes: `RuleContext`, `RuleVerdict` from `domain.models`; `Settings` from `quarantine.config`; `EventKind`, `RunState` from `domain.states`.
@@ -320,7 +320,7 @@ silent no-op there reads as a successful escalation."
 .venv/bin/python -m pytest tests/test_rules.py -v
 ```
 
-Expected: 20 failures, all `NotImplementedError`. One passes (`test_every_rule_is_registered` only inspects `RULES`).
+Expected: 19 failures, all `NotImplementedError`. One passes (`test_every_rule_is_registered` only inspects `RULES`).
 
 - [ ] **Step 2: Implement**
 
@@ -428,7 +428,7 @@ Three things the tests pin down that are easy to get wrong:
 .venv/bin/python -m pytest tests/test_rules.py -v
 ```
 
-Expected: 21 passed.
+Expected: 20 passed.
 
 - [ ] **Step 4: Confirm the domain layer is still pure**
 
@@ -461,7 +461,7 @@ history so that intermittent misbehaviour cannot hide behind auto-recovery."
 
 **Files:**
 - Modify: `quarantine/gate.py`
-- Test: `tests/test_gate.py` (exists, 33 tests, all failing)
+- Test: `tests/test_gate.py` (exists, 32 tests, all failing)
 
 **Interfaces:**
 - Consumes: `machine.escalate`, `machine.auto_recover` (Task 2); `rules.first_firing` (Task 3); `registry.risk_of` (Task 1); the `Repository` protocol; the `Judge` protocol; `Clock`.
@@ -475,7 +475,7 @@ history so that intermittent misbehaviour cannot hide behind auto-recovery."
 .venv/bin/python -m pytest tests/test_gate.py -v
 ```
 
-Expected: 33 failures, all `NotImplementedError: Gate.decide`.
+Expected: 32 failures, all `NotImplementedError: Gate.decide`.
 
 - [ ] **Step 2: Implement**
 
@@ -701,7 +701,7 @@ Four ordering decisions the tests pin down:
 .venv/bin/python -m pytest tests/test_gate.py -v
 ```
 
-Expected: 33 passed.
+Expected: 32 passed.
 
 - [ ] **Step 4: Run the whole suite to confirm nothing regressed**
 
@@ -742,7 +742,7 @@ DEGRADED already knows the answer is DENY."
 **Files:**
 - Modify: `quarantine/judge.py`
 - Create: `tests/test_claude_judge.py`
-- Test: `tests/test_failure_modes.py` (exists, 9 tests, 8 failing)
+- Test: `tests/test_failure_modes.py` (exists, 7 tests)
 
 **Interfaces:**
 - Consumes: `Run`, `Event`, `Verdict` from `domain.models`; `Severity` from `domain.states`; `JudgeUnavailable` from `quarantine.errors`.
@@ -754,7 +754,7 @@ DEGRADED already knows the answer is DENY."
 .venv/bin/python -m pytest tests/test_failure_modes.py -v
 ```
 
-Expected: 8 failures. These exercise `Gate` against an unavailable judge — most should already pass once Task 4 is done. Run them now and note which remain.
+Expected: most should already be green after Task 4. These exercise `Gate` against an unavailable judge — most should already pass once Task 4 is done. Run them now and note which remain.
 
 - [ ] **Step 2: Write the failing test for the real judge**
 
@@ -991,7 +991,7 @@ an approval, and the system would look like it was judging when it was not."
 
 **Files:**
 - Modify: `quarantine/reaper.py`
-- Test: `tests/test_reaper.py` (exists, 9 tests, all failing)
+- Test: `tests/test_reaper.py` (exists, 8 tests, all failing)
 
 **Interfaces:**
 - Consumes: `machine.escalate`, `machine.ESCALATIONS` (Task 2); `Repository.runs_with_stale_heartbeat`; `Clock`.
@@ -1003,7 +1003,7 @@ an approval, and the system would look like it was judging when it was not."
 .venv/bin/python -m pytest tests/test_reaper.py -v
 ```
 
-Expected: 9 failures, all `NotImplementedError: Reaper.sweep`.
+Expected: 8 failures, all `NotImplementedError: Reaper.sweep`.
 
 - [ ] **Step 2: Implement**
 
@@ -1046,7 +1046,7 @@ The cause is `heartbeat_timeout`, deliberately not the name of any rule: an oper
 .venv/bin/python -m pytest tests/test_reaper.py -v
 ```
 
-Expected: 9 passed. The one to watch is `test_sweep_is_idempotent_within_one_timeout` — it is what the `state_since` guard exists for.
+Expected: 8 passed. The one to watch is `test_sweep_is_idempotent_within_one_timeout` — it is what the `state_since` guard exists for.
 
 - [ ] **Step 4: Commit**
 
@@ -1071,7 +1071,7 @@ walk a run to FROZEN on the strength of a single silence."
 
 **Files:**
 - Modify: `quarantine/api.py`
-- Test: `tests/test_api.py` (exists, 21 tests, all erroring) — the `TestWorkerProtocol` class, 10 tests
+- Test: `tests/test_api.py` (exists, 19 tests, all erroring) — the `TestWorkerProtocol` class, 10 tests
 
 **Interfaces:**
 - Consumes: `Gate.decide` (Task 4); `machine.complete` (Task 2); the `Repository` protocol; `Clock`; `Settings`.
@@ -1338,7 +1338,7 @@ one, so tests get a gate whose low-risk path performs no I/O at all."
 
 **Files:**
 - Modify: `quarantine/api.py`
-- Test: `tests/test_api.py` — `TestOperatorAuthorization`, `TestRelease`, `TestInspection` (11 tests)
+- Test: `tests/test_api.py` — `TestOperatorAuthorization`, `TestRelease`, `TestInspection` (9 tests)
 
 **Interfaces:**
 - Consumes: the `operator` dependency and `Operator` alias defined in Task 7; `machine.release`, `machine.terminate`.
@@ -1350,7 +1350,7 @@ one, so tests get a gate whose low-risk path performs no I/O at all."
 .venv/bin/python -m pytest tests/test_api.py -k "Operator or Release or Inspection" -v
 ```
 
-Expected: 11 failures — 404s, because the routes do not exist yet.
+Expected: 9 failures — 404s, because the routes do not exist yet.
 
 - [ ] **Step 2: Implement**
 
@@ -1405,7 +1405,7 @@ Insert these routes in `quarantine/api.py` immediately before `return app`:
 .venv/bin/python -m pytest tests/test_api.py -v
 ```
 
-Expected: 21 passed.
+Expected: 19 passed.
 
 - [ ] **Step 4: Run the entire suite — this is the milestone**
 
