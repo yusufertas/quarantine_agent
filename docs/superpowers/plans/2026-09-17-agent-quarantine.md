@@ -1091,9 +1091,17 @@ Expected: 10 errors, `NotImplementedError: api.create_app` raised from the `clie
 
 Replace the body of `quarantine/api.py` below the module docstring.
 
-```python
-from __future__ import annotations
+**Do NOT add `from __future__ import annotations` to this module**, and remove it if
+the skeleton has it. It is the default in every other module here, so its absence is
+deliberate and worth the comment: PEP 563 turns annotations into strings, and FastAPI
+resolves them with `typing.get_type_hints`, which looks only at the function's module
+globals. `Operator` is a local of `create_app` (it closes over `settings`), so under
+PEP 563 it cannot be resolved, the `Depends` marker is silently lost, and every
+operator route answers `422 field required: actor` instead of authenticating. The
+module has no genuine forward references and Python >= 3.12 needs no future import for
+native union syntax, so dropping it costs nothing.
 
+```python
 from collections.abc import Callable
 from dataclasses import replace
 from datetime import timedelta

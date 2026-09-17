@@ -2,11 +2,11 @@
 
 **A kill switch for LLM agents that doesn't destroy the evidence.**
 
-> **Status: contract suite green; not yet runnable.** The design is settled and all 154
-> tests pass — the domain, the gate, the judge tiering, the reaper, and the HTTP surface
-> are implemented against the spec-first contract. What's still missing: persistence
-> (`SqliteRepository`, `Settings.from_env`) and the worker SDK, so the service cannot
-> actually be started yet. See [Project status](#project-status).
+> **Status: contract suite green; runnable.** The design is settled and all 182 tests
+> pass — the domain, the gate, the judge tiering, the reaper, the HTTP surface, persistence
+> (`SqliteRepository`, `Settings.from_env`), and the worker SDK are all implemented against
+> the spec-first contract. See [Project status](#project-status) and
+> [Using it from an agent](#using-it-from-an-agent) to onboard a worker.
 
 ---
 
@@ -80,6 +80,93 @@ uncertain detectors.
 **A tool that isn't in the registry is treated as `HIGH` and fails loudly.** Otherwise the
 registry quietly rots into a permit-list for anything new.
 
+## Using it from an agent
+
+The worker SDK (`quarantine.sdk.QuarantineClient`) is the thing an agent developer
+actually imports. It wraps the HTTP protocol above — gate before, report after,
+heartbeat throughout — so a worker doesn't hand-roll it. It is **not** a trust
+boundary: nothing in it is relied on for a safety property, and every guarantee
+above holds even if a worker skips it entirely. What it must get right is the
+client-side half of the fail-open/fail-closed tiering, because that's the
+behaviour that applies exactly when it can't reach the control plane at all.
+
+**No HTTP transport ships with the SDK.** `QuarantineClient` takes any object with
+a `post(path: str, body: dict) -> dict` method that raises `ConnectionError` when
+the control plane is unreachable — you supply it. A minimal one over `httpx`:
+
+```python
+import httpx
+
+class HttpTransport:
+    def __init__(self, base_url: str):
+        self._client = httpx.Client(base_url=base_url, timeout=5.0)
+
+    def post(self, path: str, body: dict) -> dict:
+        try:
+            response = self._client.post(path, json=body)
+        except httpx.TransportError as exc:
+            raise ConnectionError(str(exc)) from exc
+        response.raise_for_status()
+        return response.json()
+```
+
+Registering a run and driving it end to end:
+
+```python
+import httpx
+
+from quarantine.sdk import QuarantineClient, RunFrozen, ToolRefused
+
+transport = HttpTransport("http://localhost:8000")
+
+created = httpx.post(
+    "http://localhost:8000/runs",
+    json={
+        "agent_name": "invoice-bot",
+        "budget_tokens": 100_000,
+        "budget_cost_cents": 500,
+        "deadline_seconds": 3600,
+    },
+).json()
+
+client = QuarantineClient(run_id=created["id"], transport=transport)
+```
+
+Wrap every tool call in `client.guard(...)` instead of calling the tool directly.
+It gates the call, runs it only if permitted, and reports the outcome for you:
+
+```python
+def run_tool(tool_name: str, args: dict, args_digest: str):
+    return client.guard(tool_name, args_digest, lambda: execute(tool_name, args))
+
+
+try:
+    result = run_tool("send_email", {"to": "ops@example.com"}, digest)
+except ToolRefused:
+    # The control plane said no to this one call -- DEGRADED agents are meant
+    # to keep working. Fall back to something else instead of giving up.
+    result = run_tool("search", {"q": "escalation contact"}, other_digest)
+except RunFrozen:
+    # The run itself is suspended. Stop -- a human has to release it.
+    raise SystemExit("run frozen; awaiting operator review")
+```
+
+Send a `heartbeat()` periodically for long-running or between-tool-call gaps —
+the reaper escalates a run whose worker goes quiet — and call `complete()` once
+the agent is done so the run leaves the ladder cleanly:
+
+```python
+client.complete()
+```
+
+`heartbeat()`, `complete()`, and the outcome report inside `guard()` are all
+best-effort: if the control plane is unreachable they swallow the
+`ConnectionError` rather than crashing the agent on telemetry. An outage is
+already handled by the reaper's silence detection and needs no cooperation from
+the worker. `guard()` itself does **not** swallow errors from your own tool
+action -- it reports the failure and re-raises, so your own exception handling
+still sees it.
+
 ## Honest limitations
 
 - **The protocol is cooperative.** A worker running modified code can skip the gate. The
@@ -95,16 +182,16 @@ registry quietly rots into a permit-list for anything new.
 ## Project status
 
 The design is documented, the decisions behind it are recorded, and the contract is
-encoded as a test suite. All 154 tests pass. They were written from the spec before any
+encoded as a test suite. All 182 tests pass. They were written from the spec before any
 implementation existed, so building against them couldn't quietly redefine what the
 system is supposed to do — the domain model, the gate, the LLM judge tiering, the
-heartbeat reaper, and the HTTP surface (both the worker protocol and the human-only
-operator endpoints) are all implemented and green.
+heartbeat reaper, the HTTP surface (both the worker protocol and the human-only operator
+endpoints), persistence, and the worker SDK are all implemented and green.
 
-What's not built yet: **persistence** — `SqliteRepository` and `Settings.from_env` are
-still `NotImplementedError` — and the **worker SDK**. Until those land the service is
-demonstrably correct but cannot actually be started; it exists only against the
-in-memory test repository.
+Two things noted so nobody mistakes them for oversights: nothing runs the heartbeat
+reaper on a schedule yet (`Reaper.sweep()` is implemented and tested; wiring it to a
+periodic task is real work for its own change), and no HTTP transport ships with the
+SDK — see [Using it from an agent](#using-it-from-an-agent) for the shape you supply.
 
 ```bash
 python3 -m venv .venv && .venv/bin/pip install -e ".[dev]"
@@ -135,6 +222,8 @@ and the judge's verdict is binding.
 | `tests/test_reaper.py` | Heartbeat escalation, on an injected clock |
 | `tests/test_failure_modes.py` | The fail-open/fail-closed tiering under an unreachable judge |
 | `tests/test_api.py` | HTTP surface and operator authorization |
+| `tests/test_sqlite_store.py` | Persistence against the repository interface |
+| `tests/test_sdk.py` | Worker SDK: gate/guard/report/heartbeat, and the client-side fail-open/fail-closed tiering |
 
 ## Stack
 
