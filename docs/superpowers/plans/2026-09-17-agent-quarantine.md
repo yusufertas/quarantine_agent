@@ -1105,7 +1105,7 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
 from .domain import machine
-from .domain.models import Event, Run, ToolCall
+from .domain.models import Event, Run, ToolCall, Transition
 from .domain.states import EventKind, RunState
 from .errors import AuthorizationRequired, IllegalTransition, RunTerminated, UnknownRun
 from .gate import Gate
@@ -1141,20 +1141,32 @@ class TerminateRequest(BaseModel):
 
 
 def _run_dict(run: Run) -> dict:
+    """Serialise a run for the operator surface.
+
+    Budgets and the deadline are included, not just the counters they are
+    compared against: an operator asking "why was this frozen" needs to see
+    900 tokens used against a budget of 800, not a prose `detail` string
+    asserting it. Without them the PRD's core claim -- that a frozen run can
+    be diagnosed from what the control plane captured -- does not hold.
+    """
     return {
         "id": run.id,
         "agent_name": run.agent_name,
         "state": run.state.value,
         "state_since": run.state_since.isoformat(),
+        "created_at": run.created_at.isoformat(),
         "last_heartbeat_at": run.last_heartbeat_at.isoformat(),
         "tokens_used": run.tokens_used,
+        "budget_tokens": run.budget_tokens,
         "cost_cents": run.cost_cents,
+        "budget_cost_cents": run.budget_cost_cents,
         "tool_calls": run.tool_calls,
         "consecutive_errors": run.consecutive_errors,
+        "deadline_at": run.deadline_at.isoformat(),
     }
 
 
-def _transition_dict(t) -> dict:
+def _transition_dict(t: Transition) -> dict:
     return {
         "from": t.from_state.value,
         "to": t.to_state.value,
