@@ -11,6 +11,8 @@ permit-list for anything newly added.
 
 from __future__ import annotations
 
+from collections.abc import Iterable
+
 from .states import ToolRisk
 
 TOOL_RISKS: dict[str, ToolRisk] = {
@@ -29,10 +31,15 @@ TOOL_RISKS: dict[str, ToolRisk] = {
 
 
 def risk_of(tool_name: str) -> ToolRisk:
-    """Resolve a tool's risk. Unknown tools are HIGH."""
-    raise NotImplementedError("registry.risk_of")
+    """Resolve a tool's risk. Unknown tools are HIGH.
+
+    Exact-match lookup on purpose. "SEARCH" and " search " are not `search`;
+    normalising them would let a typo in a tool name silently inherit a LOW
+    classification that nobody reviewed.
+    """
+    return TOOL_RISKS.get(tool_name, ToolRisk.HIGH)
 
 
-def unclassified(tool_names: object) -> object:
-    """Names among `tool_names` absent from the registry, for the startup check."""
-    raise NotImplementedError("registry.unclassified")
+def unclassified(tool_names: Iterable[str]) -> tuple[str, ...]:
+    """Names absent from the registry, for the startup check."""
+    return tuple(name for name in tool_names if name not in TOOL_RISKS)
