@@ -7,11 +7,15 @@ swap rather than a rewrite, which is why this is a spec decision and not an ADR.
 
 from __future__ import annotations
 
+import json
+import sqlite3
 from collections.abc import Sequence
+from contextlib import closing
 from datetime import datetime
 
 from .domain.models import Event, Run, Transition
-from .domain.states import RunState
+from .domain.states import EventKind, RunState
+from .errors import UnknownRun
 
 SCHEMA = """
 PRAGMA journal_mode=WAL;
@@ -64,35 +68,150 @@ class SqliteRepository:
     def __init__(self, path: str) -> None:
         self._path = path
 
+    def _connect(self) -> sqlite3.Connection:
+        connection = sqlite3.connect(self._path, isolation_level=None)
+        connection.row_factory = sqlite3.Row
+        connection.execute("PRAGMA foreign_keys=ON")
+        return connection
+
     def initialize(self) -> None:
-        raise NotImplementedError("SqliteRepository.initialize")
+        with closing(self._connect()) as connection, connection:
+            connection.executescript(SCHEMA)
 
     def create_run(self, run: Run) -> None:
-        raise NotImplementedError("SqliteRepository.create_run")
-
-    def get_run(self, run_id: str) -> Run:
-        raise NotImplementedError("SqliteRepository.get_run")
+        self._write_run("INSERT INTO runs", run)
 
     def save_run(self, run: Run) -> None:
-        raise NotImplementedError("SqliteRepository.save_run")
+        self._write_run("INSERT OR REPLACE INTO runs", run)
+
+    def _write_run(self, verb: str, run: Run) -> None:
+        with closing(self._connect()) as connection, connection:
+            connection.execute(
+                f"""{verb} (
+                    id, agent_name, state, state_since, created_at, last_heartbeat_at,
+                    budget_tokens, budget_cost_cents, deadline_at,
+                    tokens_used, cost_cents, tool_calls, consecutive_errors
+                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (
+                    run.id, run.agent_name, run.state.value,
+                    run.state_since.isoformat(), run.created_at.isoformat(),
+                    run.last_heartbeat_at.isoformat(),
+                    run.budget_tokens, run.budget_cost_cents, run.deadline_at.isoformat(),
+                    run.tokens_used, run.cost_cents, run.tool_calls,
+                    run.consecutive_errors,
+                ),
+            )
+
+    def get_run(self, run_id: str) -> Run:
+        with closing(self._connect()) as connection, connection:
+            row = connection.execute("SELECT * FROM runs WHERE id = ?", (run_id,)).fetchone()
+        if row is None:
+            raise UnknownRun(run_id)
+        return _row_to_run(row)
 
     def list_runs(self, state: RunState | None = None) -> Sequence[Run]:
-        raise NotImplementedError("SqliteRepository.list_runs")
+        query, params = "SELECT * FROM runs", ()
+        if state is not None:
+            query, params = query + " WHERE state = ?", (state.value,)
+        with closing(self._connect()) as connection, connection:
+            rows = connection.execute(query + " ORDER BY created_at", params).fetchall()
+        return [_row_to_run(row) for row in rows]
 
     def append_event(self, event: Event) -> None:
-        raise NotImplementedError("SqliteRepository.append_event")
+        with closing(self._connect()) as connection, connection:
+            connection.execute(
+                """INSERT INTO events
+                   (run_id, seq, kind, created_at, tool_name, args_digest, payload)
+                   VALUES (?,?,?,?,?,?,?)""",
+                (
+                    event.run_id, event.seq, event.kind.value,
+                    event.created_at.isoformat(), event.tool_name, event.args_digest,
+                    json.dumps(event.payload, default=str),
+                ),
+            )
 
     def recent_events(self, run_id: str, limit: int) -> Sequence[Event]:
-        raise NotImplementedError("SqliteRepository.recent_events")
+        with closing(self._connect()) as connection, connection:
+            rows = connection.execute(
+                "SELECT * FROM events WHERE run_id = ? ORDER BY seq DESC LIMIT ?",
+                (run_id, limit),
+            ).fetchall()
+        return [_row_to_event(row) for row in reversed(rows)]
 
     def next_seq(self, run_id: str) -> int:
-        raise NotImplementedError("SqliteRepository.next_seq")
+        with closing(self._connect()) as connection, connection:
+            row = connection.execute(
+                "SELECT COALESCE(MAX(seq), 0) AS top FROM events WHERE run_id = ?",
+                (run_id,),
+            ).fetchone()
+        return int(row["top"]) + 1
 
     def append_transition(self, transition: Transition) -> None:
-        raise NotImplementedError("SqliteRepository.append_transition")
+        with closing(self._connect()) as connection, connection:
+            connection.execute(
+                """INSERT INTO transitions
+                   (run_id, from_state, to_state, cause, actor, detail, created_at)
+                   VALUES (?,?,?,?,?,?,?)""",
+                (
+                    transition.run_id, transition.from_state.value,
+                    transition.to_state.value, transition.cause, transition.actor,
+                    transition.detail, transition.created_at.isoformat(),
+                ),
+            )
 
     def transitions(self, run_id: str) -> Sequence[Transition]:
-        raise NotImplementedError("SqliteRepository.transitions")
+        with closing(self._connect()) as connection, connection:
+            rows = connection.execute(
+                "SELECT * FROM transitions WHERE run_id = ? ORDER BY id", (run_id,)
+            ).fetchall()
+        return [_row_to_transition(row) for row in rows]
 
     def runs_with_stale_heartbeat(self, cutoff: datetime) -> Sequence[Run]:
-        raise NotImplementedError("SqliteRepository.runs_with_stale_heartbeat")
+        with closing(self._connect()) as connection, connection:
+            rows = connection.execute(
+                "SELECT * FROM runs WHERE last_heartbeat_at < ? AND state != ?",
+                (cutoff.isoformat(), RunState.TERMINATED.value),
+            ).fetchall()
+        return [_row_to_run(row) for row in rows]
+
+
+def _row_to_run(row) -> Run:
+    return Run(
+        id=row["id"],
+        agent_name=row["agent_name"],
+        state=RunState(row["state"]),
+        state_since=datetime.fromisoformat(row["state_since"]),
+        created_at=datetime.fromisoformat(row["created_at"]),
+        last_heartbeat_at=datetime.fromisoformat(row["last_heartbeat_at"]),
+        budget_tokens=row["budget_tokens"],
+        budget_cost_cents=row["budget_cost_cents"],
+        deadline_at=datetime.fromisoformat(row["deadline_at"]),
+        tokens_used=row["tokens_used"],
+        cost_cents=row["cost_cents"],
+        tool_calls=row["tool_calls"],
+        consecutive_errors=row["consecutive_errors"],
+    )
+
+
+def _row_to_event(row) -> Event:
+    return Event(
+        run_id=row["run_id"],
+        seq=row["seq"],
+        kind=EventKind(row["kind"]),
+        created_at=datetime.fromisoformat(row["created_at"]),
+        tool_name=row["tool_name"],
+        args_digest=row["args_digest"],
+        payload=json.loads(row["payload"]),
+    )
+
+
+def _row_to_transition(row) -> Transition:
+    return Transition(
+        run_id=row["run_id"],
+        from_state=RunState(row["from_state"]),
+        to_state=RunState(row["to_state"]),
+        cause=row["cause"],
+        actor=row["actor"],
+        detail=row["detail"],
+        created_at=datetime.fromisoformat(row["created_at"]),
+    )
