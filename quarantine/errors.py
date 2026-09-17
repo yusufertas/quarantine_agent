@@ -14,7 +14,18 @@ class UnknownRun(QuarantineError):
 
 
 class RunTerminated(QuarantineError):
-    """Gate called against a TERMINATED run. An error, never a FREEZE."""
+    """Gate called against a TERMINATED run. An error, never a FREEZE.
+
+    Carries a sentence rather than a bare id: this renders straight into the
+    409 body, and `{"detail": "<uuid>"}` tells the worker developer reading it
+    nothing about what went wrong.
+    """
+
+    def __init__(self, run_id: str) -> None:
+        self.run_id = run_id
+        super().__init__(
+            f"run {run_id} is TERMINATED; it accepts no further tool calls"
+        )
 
 
 class IllegalTransition(QuarantineError):
@@ -36,4 +47,10 @@ class JudgeUnavailable(QuarantineError):
 
 
 class StoreUnavailable(QuarantineError):
-    """Storage is unreachable; the control plane cannot decide."""
+    """Storage is unreachable; the control plane cannot decide (spec §9).
+
+    Raised at the repository boundary and surfaced as `503` -- deliberately not
+    `500`, because the worker SDK tiers on it exactly as it tiers on an
+    unreachable control plane: `HIGH` blocked, `LOW` proceeds. A `500` would be
+    indistinguishable from a bug and would crash the agent instead.
+    """

@@ -14,7 +14,30 @@ from typing import Any, Protocol
 
 from .domain import registry
 from .domain.states import Decision, ToolRisk
-from .errors import QuarantineError
+from .errors import QuarantineError, RunTerminated, UnknownRun
+
+# Statuses that mean "the control plane cannot decide right now" rather than "the
+# control plane says no". Spec §9 puts a storage outage in the same row as an
+# unreachable control plane, so the client-side tiering must treat them alike: a
+# reachable server that cannot reach its own store protects a worker no better
+# than an unreachable one.
+UNAVAILABLE_STATUSES = frozenset({502, 503, 504})
+
+
+class TransportError(QuarantineError):
+    """The control plane answered, but with an error status.
+
+    Exists so the SDK can tier on *which* error. A transport that lets an
+    `httpx.HTTPStatusError` (or any other library's exception) escape hands the
+    client something it cannot classify, and a 503 then crashes the agent
+    instead of degrading it -- neither fail-closed nor fail-open.
+    """
+
+    def __init__(self, status: int, detail: str = "") -> None:
+        self.status = status
+        self.detail = detail
+        message = f"control plane returned {status}"
+        super().__init__(f"{message}: {detail}" if detail else message)
 
 
 class ToolRefused(QuarantineError):
@@ -33,7 +56,20 @@ class RunFrozen(QuarantineError):
 
 class Transport(Protocol):
     def post(self, path: str, body: dict) -> dict:
-        """Raises ConnectionError when the control plane is unreachable."""
+        """Post to the control plane and return the decoded JSON body.
+
+        Two obligations, and the client can honour spec §9 only if both hold:
+
+        * `ConnectionError` when the control plane is unreachable.
+        * `TransportError(status, detail)` for any non-2xx response. Raising the
+          HTTP library's own exception instead is what turns a 503 into a crashed
+          agent: the client cannot tier on an exception type it does not know, so
+          an outage of the *store* would escape `guard()` rather than degrade the
+          worker to safe mode.
+
+        Anything else that escapes `post` is a bug in the transport, and is
+        allowed to propagate as one.
+        """
 
 
 class QuarantineClient:
@@ -63,13 +99,30 @@ class QuarantineClient:
                 "gate", {"tool_name": tool_name, "args_digest": args_digest}
             )
         except ConnectionError:
-            # The client-side half of the tiering. It matters precisely when
-            # the server cannot enforce anything: an outage degrades the agent
-            # to safe mode rather than stopping it or leaving it unguarded.
-            if registry.risk_of(tool_name) is ToolRisk.HIGH:
-                return Decision.DENY
-            return Decision.ALLOW
+            return self._offline_decision(tool_name)
+        except TransportError as exc:
+            if exc.status in UNAVAILABLE_STATUSES:
+                # A reachable server that cannot reach its own store is, from
+                # here, indistinguishable from an unreachable one: no state, no
+                # decision, no enforcement. Same tiering (spec §9).
+                return self._offline_decision(tool_name)
+            typed = _typed(exc, self._run_id)
+            if typed is exc:
+                raise
+            raise typed from exc
         return Decision(response["decision"])
+
+    def _offline_decision(self, tool_name: str) -> Decision:
+        """The client-side half of the tiering.
+
+        It matters precisely when the server cannot enforce anything: an outage
+        degrades the agent to safe mode rather than stopping it or leaving it
+        unguarded. Unclassified means HIGH here exactly as it does on the server
+        -- a worker must not gain permissions by losing contact.
+        """
+        if registry.risk_of(tool_name) is ToolRisk.HIGH:
+            return Decision.DENY
+        return Decision.ALLOW
 
     def report(self, tool_name: str, ok: bool, tokens: int = 0, cost_cents: int = 0) -> None:
         self._try_post(
@@ -93,8 +146,25 @@ class QuarantineClient:
         an outcome report -- the reaper already treats the resulting silence as
         misbehaviour, which is the correct response and does not need the
         worker's cooperation.
+
+        Every error status is swallowed here too, not just the unreachable case:
+        this path is telemetry, and there is no outcome report worth crashing a
+        working agent over. `gate()` is where a status has to change a decision.
         """
         try:
             self._post(endpoint, body)
-        except ConnectionError:
+        except (ConnectionError, TransportError):
             pass
+
+
+def _typed(exc: TransportError, run_id: str) -> QuarantineError:
+    """Map a status the caller can act on to the package's own error.
+
+    404 and 409 are answers, not outages, and a worker developer should catch
+    `UnknownRun` rather than pattern-match on somebody's HTTP exception.
+    """
+    if exc.status == 404:
+        return UnknownRun(run_id)
+    if exc.status == 409:
+        return RunTerminated(run_id)
+    return exc
