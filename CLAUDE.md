@@ -16,11 +16,13 @@ reasoning is not re-derivable from the code:
 - [`docs/adr/0002-graded-quarantine-ladder.md`](docs/adr/0002-graded-quarantine-ladder.md) — why quarantine is a ladder
 - [`docs/adr/0003-tier-llm-judge-by-tool-risk.md`](docs/adr/0003-tier-llm-judge-by-tool-risk.md) — why the judge is tiered
 
-**Status: contract suite green (154/154); not yet runnable.** The domain, gate, judge
-tiering, reaper, and HTTP surface (worker protocol + human-only operator endpoints) are
-all implemented against the spec-first test suite. Still unbuilt: persistence
-(`SqliteRepository` and `Settings.from_env` are `NotImplementedError`) and the worker
-SDK — so the service cannot actually be started yet.
+**Status: contract suite green (182/182); runnable.** The domain, gate, judge tiering,
+reaper, HTTP surface (worker protocol + human-only operator endpoints), persistence
+(`SqliteRepository`, `Settings.from_env`), and the worker SDK are all implemented against
+the spec-first test suite. Real gaps that remain: nothing schedules `Reaper.sweep()` on a
+loop, background judging only fires when a scheduler is injected (`main.build()` supplies
+one; tests deliberately do not), and no HTTP transport ships with the SDK — the developer
+supplies a `post(path, body) -> dict`.
 
 ## Architecture invariants
 
@@ -73,13 +75,15 @@ python3 -m venv .venv && .venv/bin/pip install -e ".[dev]"   # setup
 .venv/bin/python -m pytest tests/test_gate.py                 # one file
 .venv/bin/python -m pytest tests/test_gate.py::TestDecisionMatrix::test_every_cell
 .venv/bin/python -m pytest -k "flap or recovery"               # by name
-.venv/bin/uvicorn quarantine.api:create_app --factory --reload # run the service
+QUARANTINE_OPERATOR_TOKEN=dev .venv/bin/uvicorn quarantine.main:build --factory # run the service
 ```
 
-The suite is now **green**: all 154 tests pass. Persistence and the worker SDK
-(`SqliteRepository`, `Settings.from_env`) remain `NotImplementedError` by design — that
-work is still ahead — but nothing in the current contract exercises them, so a failure
-anywhere else means something is genuinely broken.
+The suite is now **green**: all 182 tests pass. Persistence (`SqliteRepository`,
+`Settings.from_env`) and the worker SDK are implemented, and the service starts via
+`quarantine.main:build` (not `quarantine.api:create_app`, which takes injected
+collaborators directly and bypasses the env wiring and operator-token check
+`main.build()` performs). Nothing in the current contract exercises code paths beyond
+what's tested, so a failure anywhere means something is genuinely broken.
 
 ## Tracker
 
