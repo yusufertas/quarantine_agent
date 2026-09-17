@@ -62,49 +62,64 @@ def register(client: TestClient) -> str:
     return response.json()["id"]
 
 
-def drive(client: TestClient, run_id: str, calls: int, *, digest_of=None) -> None:
+def drive(
+    client: TestClient, run_id: str, calls: int, *, tool_name="search", digest_of=None
+) -> None:
     """One realistic worker turn per iteration: gate, then report the outcome.
 
     Distinct `args_digest` values by default so `loop` cannot fire -- this has to
     be `call_rate` or it proves nothing. `ok=True` keeps `error_streak` quiet too.
+
+    `tool_name` defaults to `search` (LOW risk, 3 rows per call: PROPOSED,
+    DECISION, OUTCOME). Pass a HIGH-risk tool such as `issue_payment` to drive
+    the 4-row path instead (PROPOSED, JUDGE, DECISION, OUTCOME) -- the path with
+    zero headroom against the window, and the one the row/call amplification
+    actually threatens.
     """
     digest_of = digest_of or (lambda i: f"d{i}")
     for i in range(calls):
         client.post(
             f"/runs/{run_id}/gate",
-            json={"tool_name": "search", "args_digest": digest_of(i)},
+            json={"tool_name": tool_name, "args_digest": digest_of(i)},
         )
         client.post(
-            f"/runs/{run_id}/outcome", json={"tool_name": "search", "ok": True}
+            f"/runs/{run_id}/outcome", json={"tool_name": tool_name, "ok": True}
         )
 
 
+@pytest.mark.parametrize("tool_name", ["search", "issue_payment"])
 class TestCallRateFiresInPractice:
     """The clock is frozen, so every call lands inside the trailing minute --
-    an infinite call rate, which is the shape of the real thrashing agent."""
+    an infinite call rate, which is the shape of the real thrashing agent.
+
+    Parametrised over a LOW-risk tool (`search`, 3 rows/call) and a HIGH-risk
+    one (`issue_payment`, 4 rows/call, consulting the judge): the HIGH-risk
+    path has zero headroom against the window and is exactly the one a drifting
+    events-per-call ratio would silently disable first.
+    """
 
     def test_a_run_calling_far_above_the_threshold_is_escalated(
-        self, client, store
+        self, client, store, tool_name
     ):
         run_id = register(client)
-        drive(client, run_id, calls=RATE * 3)
+        drive(client, run_id, calls=RATE * 3, tool_name=tool_name)
         assert store.get_run(run_id).state is not RunState.HEALTHY
 
-    def test_the_recorded_cause_is_call_rate(self, client, store):
+    def test_the_recorded_cause_is_call_rate(self, client, store, tool_name):
         """Not merely 'something escalated it' -- the operator reads this cause."""
         run_id = register(client)
-        drive(client, run_id, calls=RATE * 3)
+        drive(client, run_id, calls=RATE * 3, tool_name=tool_name)
         causes = [t.cause for t in store.transitions(run_id)]
         assert causes and causes[0] == "call_rate", causes
 
     def test_the_gate_sees_more_proposals_than_the_threshold(
-        self, client, store, clock, settings
+        self, client, store, clock, settings, tool_name
     ):
         """The mechanism, stated directly: the history window the gate passes to
         the rules must be able to hold more than `call_rate_per_minute` PROPOSED
         rows. When it could not, everything above was unreachable."""
         run_id = register(client)
-        drive(client, run_id, calls=RATE * 3)
+        drive(client, run_id, calls=RATE * 3, tool_name=tool_name)
         limit = Gate(
             store=store, judge=FakeJudge(), clock=clock, settings=settings
         )._history_limit()
@@ -115,11 +130,11 @@ class TestCallRateFiresInPractice:
             f"the detector needs more than {RATE} to fire at all"
         )
 
-    def test_a_run_below_the_threshold_is_left_alone(self, client, store):
+    def test_a_run_below_the_threshold_is_left_alone(self, client, store, tool_name):
         """The other half: a window sized for the amplification must not turn
         the detector into a hair trigger."""
         run_id = register(client)
-        drive(client, run_id, calls=RATE - 5)
+        drive(client, run_id, calls=RATE - 5, tool_name=tool_name)
         assert store.get_run(run_id).state is RunState.HEALTHY
 
 
@@ -139,3 +154,41 @@ class TestLoopFiresInPractice:
         run_id = register(client)
         drive(client, run_id, calls=3)
         assert store.get_run(run_id).state is RunState.HEALTHY
+
+
+class TestLoopFiresOnAHighRiskToolAtATightenedThreshold:
+    """The same row/call amplification `call_rate` had, still live in `loop`.
+
+    `search` (LOW risk) writes 3 rows per call and leaves `loop`'s default
+    window (10 rows) enough headroom to hide the bug. `issue_payment` (HIGH
+    risk) writes 4 -- PROPOSED, JUDGE, DECISION, OUTCOME -- and an operator who
+    tightens `LOOP_REPEATS` from the default of 3 to 4 (a documented,
+    operator-tunable setting) silently loses the detector entirely on this
+    path: a row-sliced window of 10 can hold at most two full HIGH-risk calls'
+    worth of proposals, never four. This is the case that regresses if the
+    filter-before-slice fix in `rules.loop` is ever reverted.
+    """
+
+    @pytest.fixture
+    def settings(self) -> Settings:
+        return Settings(operator_token="test-token", loop_repeats=4)
+
+    @pytest.fixture
+    def client(self, store, clock, settings) -> TestClient:
+        # A HIGH-risk tool call blocks on the judge; a CLEAR verdict lets it
+        # through without touching the machinery this test isn't about.
+        return TestClient(
+            create_app(store=store, judge=FakeJudge(), clock=clock, settings=settings)
+        )
+
+    def test_repeating_a_high_risk_call_four_times_is_escalated(self, client, store):
+        run_id = register(client)
+        drive(
+            client,
+            run_id,
+            calls=4,
+            tool_name="issue_payment",
+            digest_of=lambda _: "identical",
+        )
+        assert store.get_run(run_id).state is not RunState.HEALTHY
+        assert [t.cause for t in store.transitions(run_id)] == ["loop"]
