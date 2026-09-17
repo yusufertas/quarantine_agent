@@ -91,11 +91,23 @@ client-side half of the fail-open/fail-closed tiering, because that's the
 behaviour that applies exactly when it can't reach the control plane at all.
 
 **No HTTP transport ships with the SDK.** `QuarantineClient` takes any object with
-a `post(path: str, body: dict) -> dict` method that raises `ConnectionError` when
-the control plane is unreachable — you supply it. A minimal one over `httpx`:
+a `post(path: str, body: dict) -> dict` method — you supply it. It owes the client
+two things, and the tiering above only works if both hold:
+
+- `ConnectionError` when the control plane is unreachable.
+- `TransportError(status, detail)` for **any** non-2xx response.
+
+The second one matters more than it looks. A `503` means the control plane is up but
+cannot reach its own state — from the worker's side that is an outage, and it must
+tier exactly like an unreachable server. Letting your HTTP library's own exception
+escape instead hands the client something it cannot classify, so the `503` propagates
+straight through `guard()` and kills the agent: neither fail-closed nor fail-open.
+A minimal transport over `httpx`:
 
 ```python
 import httpx
+
+from quarantine.sdk import TransportError
 
 class HttpTransport:
     def __init__(self, base_url: str):
@@ -106,9 +118,14 @@ class HttpTransport:
             response = self._client.post(path, json=body)
         except httpx.TransportError as exc:
             raise ConnectionError(str(exc)) from exc
-        response.raise_for_status()
+        if response.status_code >= 400:
+            raise TransportError(response.status_code, response.text)
         return response.json()
 ```
+
+`guard()` then turns a `404` into `UnknownRun` and a `409` into `RunTerminated` —
+the package's own errors, not the HTTP library's — so a worker catches something
+meaningful instead of pattern-matching on status codes.
 
 Registering a run and driving it end to end:
 
@@ -160,8 +177,8 @@ client.complete()
 ```
 
 `heartbeat()`, `complete()`, and the outcome report inside `guard()` are all
-best-effort: if the control plane is unreachable they swallow the
-`ConnectionError` rather than crashing the agent on telemetry. An outage is
+best-effort: if the control plane is unreachable or answers with an error they
+swallow it rather than crashing the agent on telemetry. An outage is
 already handled by the reaper's silence detection and needs no cooperation from
 the worker. `guard()` itself does **not** swallow errors from your own tool
 action -- it reports the failure and re-raises, so your own exception handling
@@ -188,10 +205,21 @@ system is supposed to do — the domain model, the gate, the LLM judge tiering, 
 heartbeat reaper, the HTTP surface (both the worker protocol and the human-only operator
 endpoints), persistence, and the worker SDK are all implemented and green.
 
-Two things noted so nobody mistakes them for oversights: nothing runs the heartbeat
-reaper on a schedule yet (`Reaper.sweep()` is implemented and tested; wiring it to a
-periodic task is real work for its own change), and no HTTP transport ships with the
-SDK — see [Using it from an agent](#using-it-from-an-agent) for the shape you supply.
+Three things noted so nobody mistakes them for oversights:
+
+- **Nothing runs the heartbeat reaper on a schedule yet.** `Reaper.sweep()` is implemented
+  and tested; wiring it to a periodic task is real work for its own change.
+- **No HTTP transport ships with the SDK** — see
+  [Using it from an agent](#using-it-from-an-agent) for the shape you supply.
+- **Calls made while the control plane is unreachable are never replayed.** The SDK decides
+  offline (`HIGH` refused, `LOW` allowed) and forgets it did. The consequence is worth
+  stating plainly: those calls are **absent from the trajectory an operator later reads**,
+  so a gap in the event log means "we could not see" rather than "nothing happened". This is
+  a decision, not an omission — buffering would put durable, unbounded local state in a
+  module that ADR-0001 defines as a convenience and explicitly not a trust boundary, to
+  produce telemetry the control plane could not rely on anyway. The reaper still escalates
+  a run whose worker went silent, which needs no cooperation from the worker. Reasoning in
+  [spec §9](docs/superpowers/specs/2026-09-17-agent-quarantine-design.md).
 
 ```bash
 python3 -m venv .venv && .venv/bin/pip install -e ".[dev]"
@@ -224,6 +252,10 @@ and the judge's verdict is binding.
 | `tests/test_api.py` | HTTP surface and operator authorization |
 | `tests/test_sqlite_store.py` | Persistence against the repository interface |
 | `tests/test_sdk.py` | Worker SDK: gate/guard/report/heartbeat, and the client-side fail-open/fail-closed tiering |
+| `tests/test_detector_integration.py` | `call_rate` and `loop` driven through real gate calls — that the detectors can fire at all, not just that their arithmetic is right |
+| `tests/test_storage_concurrency.py` | Concurrent writers against real SQLite: a containment survives an in-flight counter write, and concurrent appends do not collide |
+| `tests/test_store_unavailable.py` | Spec §9's storage row on both halves: `503` from the API, client-side tiering in the SDK |
+| `tests/test_operator_surface.py` | All five human-only routes reject an unauthenticated caller; release defaults |
 
 ## Stack
 
