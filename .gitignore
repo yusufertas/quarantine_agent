@@ -10,3 +10,5 @@ venv/
 .idea/
 quarantine.egg-info/
 *.egg-info/
+.superpowers/
+.worktrees/
