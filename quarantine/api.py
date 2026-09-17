@@ -5,8 +5,6 @@ registered worker calls, and the operator endpoints, which require a human. Rele
 a FROZEN run is the operation that must never become automatic (ADR-0002).
 """
 
-from __future__ import annotations
-
 from collections.abc import Callable
 from dataclasses import replace
 from datetime import timedelta
@@ -213,6 +211,45 @@ def create_app(
     def complete(run_id: str) -> dict:
         run = store.get_run(run_id)
         updated, transition = machine.complete(run, now=clock.now())
+        store.save_run(updated)
+        store.append_transition(transition)
+        return {"state": updated.state.value}
+
+    # ---- operator surface (human actor required) -------------------------
+
+    @app.get("/runs")
+    def list_runs(actor: Operator, state: RunState | None = None) -> list[dict]:
+        return [_run_dict(run) for run in store.list_runs(state)]
+
+    @app.get("/runs/{run_id}")
+    def run_detail(run_id: str, actor: Operator) -> dict:
+        run = store.get_run(run_id)
+        return {
+            **_run_dict(run),
+            "transitions": [_transition_dict(t) for t in store.transitions(run_id)],
+        }
+
+    @app.get("/runs/{run_id}/trajectory")
+    def trajectory(run_id: str, actor: Operator) -> list[dict]:
+        store.get_run(run_id)          # 404 for an unknown run
+        return [_event_dict(e) for e in store.recent_events(run_id, 1000)]
+
+    @app.post("/runs/{run_id}/release")
+    def release(run_id: str, actor: Operator, body: ReleaseRequest) -> dict:
+        run = store.get_run(run_id)
+        updated, transition = machine.release(
+            run, target=body.target, actor=actor, now=clock.now(), detail=body.detail
+        )
+        store.save_run(updated)
+        store.append_transition(transition)
+        return {"state": updated.state.value}
+
+    @app.post("/runs/{run_id}/terminate")
+    def terminate(run_id: str, actor: Operator, body: TerminateRequest) -> dict:
+        run = store.get_run(run_id)
+        updated, transition = machine.terminate(
+            run, actor=actor, now=clock.now(), detail=body.detail
+        )
         store.save_run(updated)
         store.append_transition(transition)
         return {"state": updated.state.value}
