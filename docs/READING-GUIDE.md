@@ -77,7 +77,7 @@ Read in this order:
 By the end of this section you understand the entire decision model. Everything after
 is plumbing.
 
-## 4. Where it composes — `quarantine/gate.py` (15 min, 253 lines)
+## 4. Where it composes — `quarantine/gate.py` (15 min)
 
 The hot path. Read `Gate.decide()` slowly — **the order of its statements carries the
 semantics**, and the docstring explains each ordering choice:
@@ -91,6 +91,10 @@ semantics**, and the docstring explains each ordering choice:
   double-counted and the loop rule trips a call early)
 - rules run *before* the tool-risk lookup (an escalation must stop *this* call, not the
   next one)
+- the repository checks the state revision again when committing a transition or
+  final decision; a judge's earlier snapshot cannot override newer containment
+- background cadence counts LOW proposals, bounded by this call's allocated
+  sequence, not the changing population of telemetry and judge rows
 
 Then read the decision matrix in
 [`docs/superpowers/specs/2026-09-17-agent-quarantine-design.md`](superpowers/specs/2026-09-17-agent-quarantine-design.md)
@@ -100,22 +104,26 @@ Then read the decision matrix in
 
 Now the plumbing, in descending order of interest:
 
-- **`sqlite_store.py`** (313 lines) — persistence. Read `record_state_change` and
+- **`sqlite_store.py`** — persistence. Read `record_state_change` and
   `append_event`: the first wraps a state change and its audit row in one transaction so
   a crash cannot separate them; the second allocates `seq` *inside* the insert because
   allocating it separately raced. Note `save_run` is a targeted `UPDATE` that physically
   cannot carry `state` — the machine-only-writer rule enforced by the storage layer
-  rather than by convention.
-- **`api.py`** (304 lines) — HTTP. Two audiences: unauthenticated worker endpoints, and
+  rather than by convention. That legacy snapshot method is not safe for concurrent
+  counter updates: HTTP now uses atomic `record_outcome` and `touch_heartbeat`.
+  State changes compare the append-only transition revision inside their transaction;
+  reaper transitions also compare the selected heartbeat. No model call holds the lock.
+- **`api.py`** — HTTP. Two audiences: unauthenticated worker endpoints, and
   operator endpoints that require a human. Read the `operator` dependency and note there
   is no fallback to a system actor.
-- **`sdk.py`** (170 lines) — what an agent developer imports. **It is not a trust
-  boundary** — every safety property must hold when a worker bypasses it, which is what
-  the reaper is for. What it *does* own is the client-side fail-closed/fail-open tiering.
-- **`judge.py`** (105 lines) — the LLM classifier. Note every failure path becomes
+- **`sdk.py`** — what an agent developer imports. **It is not a trust
+  boundary**: a hostile worker can bypass it. The reaper observes missing liveness,
+  not actual process execution. The SDK owns client-side fail-closed/fail-open tiering
+  and can forward an optional, caller-redacted argument preview.
+- **`judge.py`** — the LLM classifier. Note every failure path becomes
   `JudgeUnavailable`; it never returns a clear verdict to paper over an outage.
-- **`reaper.py`** (51 lines) — treats silence as misbehaviour. Two `continue` guards,
-  both load-bearing; the file explains each.
+- **`reaper.py`** — treats silence as misbehaviour. Fresh heartbeat or outcome
+  reports invalidate a stale selection at commit time, without losing genuine timeouts.
 - **`main.py`** (44 lines) — production wiring. Refuses to boot without an operator token.
 
 ---
@@ -177,21 +185,33 @@ Things that look wrong and are not. Each was found the hard way.
 
 ## 9. How much to trust the tests
 
-258 tests, and they are not equal evidence:
+The integrated suite collects 513 cases. They are not equal evidence; exact run
+results and known failures are in the [integrity audit](audits/2026-09-19-control-plane-integrity.md):
 
 - **147 in the seven "contract" files** (`test_registry`, `test_machine`, `test_rules`,
   `test_gate`, `test_failure_modes`, `test_reaper`, `test_api`) were written from the
-  spec **before any implementation existed**, and have been byte-identical ever since.
-  These are the strongest evidence in the repo.
-- **The rest were written alongside the code they test**, so they prove the code agrees
-  with itself. Weight accordingly.
+  spec **before any implementation existed**. Their assertions are retained;
+  this patch removes three unused imports from two of those files.
+- **Implementation-time tests are not automatically independent evidence.** The
+  audit distinguishes controls that fail against the original code from supporting
+  cases that pass both versions. The new test sets retain all original node IDs.
 - **`tests/conftest.py`'s `InMemoryRepository` is a fake**, and most tests run against
-  it. It is known to diverge from the real SQLite store in at least two places (see
-  Known gaps). Storage and concurrency tests deliberately use the real store.
+  it. Two legacy `save_run` divergences are explicitly tested in
+  `test_repository_contract.py`: the fake writes state and creates unknown runs,
+  whereas SQLite does neither. Both now allocate event sequences. This is not an
+  exhaustive equivalence claim (`recent_events(..., 0)` also differs). Storage and
+  concurrency tests use real SQLite; `test_assembled_system.py` combines SDK, HTTP,
+  gate and reaper over a real database file. Factory tests stub model evaluation.
 
 A green suite here does not mean "correct" — two detectors passed their unit tests while
 being completely dead in the assembled system. `tests/test_detector_integration.py`
 exists because of that.
+
+One test has `xfail(strict=True)`: terminate without a JSON body returns 422,
+unlike release. A fix must remove that marker. SQLite concurrent-append failures
+are NOT marked xfail, skipped, retried or given a relaxed timeout: they remain
+visible failures, also reproduced on the untouched baseline. See the audit for
+both passing and failing runs rather than inferring stability from the test count.
 
 ## 10. Known gaps
 

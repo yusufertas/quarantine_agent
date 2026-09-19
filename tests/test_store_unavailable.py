@@ -143,6 +143,12 @@ class TestWorkerSurvivesAStoreOutageEndToEnd:
             def get_run(self, run_id):
                 raise StoreUnavailable("disk went away")
 
+            def record_outcome(self, event):
+                raise StoreUnavailable("disk went away")
+
+            def touch_heartbeat(self, run_id, now):
+                raise StoreUnavailable("disk went away")
+
         app = create_app(
             store=BrokenStore(), judge=FakeJudge(), clock=clock, settings=settings
         )

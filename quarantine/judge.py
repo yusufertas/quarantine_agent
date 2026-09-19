@@ -56,7 +56,11 @@ class JudgeVerdictModel(BaseModel):
 
 
 class ClaudeJudge:
-    """Judge backed by the Claude API. No unit test constructs a real one."""
+    """Judge backed by the Claude API. No unit test constructs a real one.
+
+    `timeout_seconds` sets per-request transport timeouts, not a hard wall-clock
+    deadline for `evaluate()`. Transport retries are explicitly disabled.
+    """
 
     def __init__(
         self,
@@ -71,7 +75,9 @@ class ClaudeJudge:
     def evaluate(self, run: Run, trajectory: Sequence[Event]) -> Verdict:
         prompt = self._render(run, trajectory)
         try:
-            response = self._client.with_options(timeout=self._timeout).messages.parse(
+            response = self._client.with_options(
+                timeout=self._timeout, max_retries=0
+            ).messages.parse(
                 model=self._model,
                 max_tokens=4096,
                 system=SYSTEM_PROMPT,
@@ -100,6 +106,7 @@ class ClaudeJudge:
         for event in trajectory:
             lines.append(
                 f"  [{event.seq}] {event.kind.value} {event.tool_name or ''} "
+                f"args_digest={json.dumps(event.args_digest)} "
                 f"{json.dumps(event.payload, default=str)}"
             )
         return "\n".join(lines)

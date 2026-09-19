@@ -13,8 +13,7 @@ from __future__ import annotations
 import pytest
 
 from conftest import FakeJudge, UnavailableJudge, call, make_run
-from quarantine.domain.models import Verdict
-from quarantine.domain.states import Decision, EventKind, RunState, Severity
+from quarantine.domain.states import Decision, EventKind, RunState
 from quarantine.gate import Gate
 
 LOW = "search"

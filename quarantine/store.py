@@ -11,7 +11,9 @@ from datetime import datetime
 from typing import Protocol
 
 from .domain.models import Event, Run, Transition
-from .domain.states import RunState
+from .domain.states import Decision, RunState
+
+MAX_COUNTER = 2**63 - 1
 
 
 class Repository(Protocol):
@@ -21,7 +23,10 @@ class Repository(Protocol):
         """Raises UnknownRun if absent. Never returns a permissive placeholder."""
 
     def save_run(self, run: Run) -> None:
-        """Persist the run's counters and heartbeat. It CANNOT write `state`.
+        """Legacy snapshot write for compatibility. It CANNOT write `state`.
+
+        Not concurrency-safe for counters: request handlers must use
+        record_outcome or touch_heartbeat, never this method.
 
         Callers hold a snapshot read moments earlier, so writing the whole row
         back would erase any escalation that landed in between -- while the
@@ -31,27 +36,61 @@ class Repository(Protocol):
         caller to remember it; `record_state_change` is the only state path.
         """
 
-    def record_state_change(self, run: Run, transition: Transition) -> None:
+    def record_outcome(self, event: Event) -> None:
+        """Atomically add usage deltas, update liveness, and append the outcome.
+
+        Reject negative/overflowing usage with InvalidUsage. Never write state.
+        """
+
+    def touch_heartbeat(self, run_id: str, now: datetime) -> None:
+        """Advance only liveness, never overwrite counters with a snapshot."""
+
+    def record_state_change(
+        self, run: Run, transition: Transition, *, expected_heartbeat: datetime | None = None,
+    ) -> Run:
         """Write a state change and its audit row atomically.
 
         `run` must be the output of a `domain.machine` function and `transition`
         its companion. Only `state` and `state_since` are taken from `run` --
-        counters belong to `save_run` -- so a concurrent outcome report cannot be
+        counters belong to `record_outcome` -- so a concurrent outcome report cannot be
         clobbered by an escalation, or the reverse.
 
         One transaction: spec §4 invariant 4 requires that no state change exist
         without its transition row, which two separate writes cannot promise.
+
+        Compare run.state_revision and transition.from_state against current
+        storage before writing. Raise ConcurrentStateChange on a stale snapshot,
+        including a state that cycled back to its old value; return the committed
+        run with its new revision. No lock is held while a judge evaluates.
+        When expected_heartbeat is supplied, require it to remain unchanged in
+        the same transaction: a timeout depends on liveness as well as state.
+        """
+
+    def record_decision(self, event: Event, expected_revision: int) -> Decision:
+        """Validate containment and append a decision in one transaction.
+
+        TERMINATED raises RunTerminated; FROZEN returns FREEZE. An ALLOW based on
+        a changed revision becomes DENY, never a new authorization. The returned
+        decision must match the persisted event.
         """
 
     def list_runs(self, state: RunState | None = None) -> Sequence[Run]: ...
 
-    def append_event(self, event: Event) -> None:
+    def append_event(self, event: Event) -> int:
         """Append-only. There is deliberately no update or delete.
 
         The repository allocates `seq`: allocation and insertion must be one
         atomic step, so `event.seq` is advisory and may be replaced. Reading the
         high-water mark in one statement and inserting in another is a race that
         loses rows to the `(run_id, seq)` primary key under concurrency.
+        Return the allocated sequence, not the caller's advisory value.
+        """
+
+    def count_proposals(self, run_id: str, through_seq: int, tools: Sequence[str]) -> int:
+        """Count proposals for the given tools up to an allocated sequence.
+
+        Bounding by this call's sequence keeps concurrent callers from sharing
+        another call's ordinal; unrelated event kinds never affect sampling.
         """
 
     def recent_events(self, run_id: str, limit: int) -> Sequence[Event]: ...

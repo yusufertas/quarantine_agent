@@ -38,6 +38,8 @@ class Run:
     cost_cents: int = 0
     tool_calls: int = 0
     consecutive_errors: int = 0
+    # Opaque repository token derived from the append-only transition log.
+    state_revision: int = 0
 
 
 @dataclass(frozen=True, slots=True)

@@ -14,8 +14,8 @@ import pytest
 
 from quarantine.config import Settings
 from quarantine.domain.models import Event, Run, ToolCall, Transition, Verdict
-from quarantine.domain.states import EventKind, RunState, Severity
-from quarantine.errors import JudgeUnavailable, UnknownRun
+from quarantine.domain.states import Decision, EventKind, RunState, Severity
+from quarantine.errors import ConcurrentStateChange, JudgeUnavailable, RunTerminated, UnknownRun
 
 T0 = datetime(2026, 9, 17, 12, 0, 0, tzinfo=UTC)
 
@@ -77,17 +77,60 @@ class InMemoryRepository:
         # and a heartbeat, and `record_state_change` is the only state path.
         self.runs[run.id] = run
 
-    def record_state_change(self, run: Run, transition: Transition) -> None:
-        """Atomic in SQLite; here just the two writes, in order."""
-        self.runs[run.id] = run
+    def record_outcome(self, event: Event) -> None:
+        run = self.get_run(event.run_id)
+        self.runs[run.id] = replace(
+            run, tokens_used=run.tokens_used + event.payload["tokens"],
+            cost_cents=run.cost_cents + event.payload["cost_cents"],
+            tool_calls=run.tool_calls + 1,
+            consecutive_errors=0 if event.payload["ok"] else run.consecutive_errors + 1,
+            last_heartbeat_at=max(run.last_heartbeat_at, event.created_at),
+        )
+        self.append_event(replace(event, seq=self.next_seq(run.id)))
+
+    def touch_heartbeat(self, run_id, now) -> None:
+        run = self.get_run(run_id)
+        self.runs[run_id] = replace(run, last_heartbeat_at=max(run.last_heartbeat_at, now))
+
+    def record_state_change(self, run: Run, transition: Transition, *, expected_heartbeat=None) -> Run:
+        current = self.get_run(run.id)
+        if (current.state_revision != run.state_revision
+                or current.state is not transition.from_state):
+            raise ConcurrentStateChange(run.id)
+        if expected_heartbeat is not None and current.last_heartbeat_at != expected_heartbeat:
+            raise ConcurrentStateChange(run.id)
+        updated = replace(current, state=run.state, state_since=run.state_since,
+                          state_revision=current.state_revision + 1)
+        self.runs[run.id] = updated
         self.transitions_log.append(transition)
+        return updated
+
+    def record_decision(self, event: Event, expected_revision: int) -> Decision:
+        run = self.get_run(event.run_id)
+        if run.state is RunState.TERMINATED:
+            raise RunTerminated(run.id)
+        decision = Decision(event.payload["decision"])
+        if run.state is RunState.FROZEN:
+            decision = Decision.FREEZE
+        elif decision is Decision.ALLOW and run.state_revision != expected_revision:
+            decision = Decision.DENY
+        self.append_event(replace(event, seq=self.next_seq(run.id), payload={
+            **event.payload, "decision": decision.value, "state_revision": run.state_revision,
+        }))
+        return decision
 
     def list_runs(self, state: RunState | None = None) -> Sequence[Run]:
         runs = list(self.runs.values())
         return [r for r in runs if state is None or r.state is state]
 
-    def append_event(self, event: Event) -> None:
-        self.events.append(event)
+    def append_event(self, event: Event) -> int:
+        seq = self.next_seq(event.run_id)
+        self.events.append(replace(event, seq=seq))
+        return seq
+
+    def count_proposals(self, run_id, through_seq, tools) -> int:
+        return sum(e.run_id == run_id and e.kind is EventKind.PROPOSED
+                   and e.seq <= through_seq and e.tool_name in tools for e in self.events)
 
     def recent_events(self, run_id: str, limit: int) -> Sequence[Event]:
         return [e for e in self.events if e.run_id == run_id][-limit:]

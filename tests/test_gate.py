@@ -11,7 +11,7 @@ from datetime import timedelta
 
 import pytest
 
-from conftest import FakeJudge, T0, UnavailableJudge, call, make_event, make_run
+from conftest import FakeJudge, T0, call, make_event, make_run
 from quarantine.config import Settings
 from quarantine.domain.models import Verdict
 from quarantine.domain.states import Decision, EventKind, RunState, Severity
