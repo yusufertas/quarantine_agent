@@ -11,11 +11,19 @@ import json
 import sqlite3
 from collections.abc import Iterator, Sequence
 from contextlib import closing, contextmanager
+from dataclasses import replace
 from datetime import datetime
 
 from .domain.models import Event, Run, Transition
-from .domain.states import EventKind, RunState
-from .errors import StoreUnavailable, UnknownRun
+from .domain.states import Decision, EventKind, RunState
+from .errors import (
+    ConcurrentStateChange,
+    InvalidUsage,
+    RunTerminated,
+    StoreUnavailable,
+    UnknownRun,
+)
+from .store import MAX_COUNTER
 
 SCHEMA = """
 PRAGMA journal_mode=WAL;
@@ -61,7 +69,15 @@ CREATE TABLE IF NOT EXISTS transitions (
 CREATE INDEX IF NOT EXISTS idx_runs_state ON runs(state);
 CREATE INDEX IF NOT EXISTS idx_runs_heartbeat ON runs(last_heartbeat_at);
 CREATE INDEX IF NOT EXISTS idx_transitions_run ON transitions(run_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_transitions_revision ON transitions(run_id, id);
+CREATE INDEX IF NOT EXISTS idx_events_sampling ON events(run_id, kind, tool_name, seq);
 """
+
+# The append-only log already supplies a monotonic version, including for older
+# databases. This avoids a schema migration and catches same-time ABA cycles.
+RUN_SELECT = """SELECT runs.*,
+    COALESCE((SELECT MAX(id) FROM transitions WHERE run_id = runs.id), 0)
+    AS state_revision FROM runs"""
 
 
 class SqliteRepository:
@@ -105,6 +121,23 @@ class SqliteRepository:
         with self._session() as connection:
             connection.executescript(SCHEMA)
 
+    @contextmanager
+    def _transaction(self):
+        with self._session() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                yield connection
+                connection.execute("COMMIT")
+            except BaseException:
+                connection.execute("ROLLBACK")
+                raise
+
+    def _get_run(self, connection, run_id: str) -> Run:
+        row = connection.execute(RUN_SELECT + " WHERE runs.id = ?", (run_id,)).fetchone()
+        if row is None:
+            raise UnknownRun(run_id)
+        return _row_to_run(row)
+
     def create_run(self, run: Run) -> None:
         with self._session() as connection:
             connection.execute(
@@ -124,7 +157,10 @@ class SqliteRepository:
             )
 
     def save_run(self, run: Run) -> None:
-        """Counters and heartbeat. `state` and `state_since` are NOT in this UPDATE.
+        """Legacy snapshot write; not safe for concurrent counter updates.
+
+        HTTP handlers use record_outcome/touch_heartbeat instead. `state` and
+        `state_since` are NOT in this UPDATE.
 
         That omission is the point, not an oversight. Callers reach here holding a
         snapshot read moments earlier; an `INSERT OR REPLACE` of the whole row would
@@ -155,53 +191,106 @@ class SqliteRepository:
             # An update that matched nothing is a lost write, not a no-op.
             raise UnknownRun(run.id)
 
-    def record_state_change(self, run: Run, transition: Transition) -> None:
+    def record_outcome(self, event: Event) -> None:
+        if event.kind is not EventKind.OUTCOME:
+            raise ValueError("record_outcome requires an OUTCOME event")
+        tokens, cost = event.payload["tokens"], event.payload["cost_cents"]
+        if any(type(n) is not int or not 0 <= n <= MAX_COUNTER for n in (tokens, cost)):
+            raise InvalidUsage("tokens and cost_cents must be non-negative 64-bit integers")
+        with self._transaction() as connection:
+            current = self._get_run(connection, event.run_id)
+            errors = 0 if event.payload["ok"] else current.consecutive_errors + 1
+            if any(n > MAX_COUNTER for n in (
+                current.tokens_used + tokens, current.cost_cents + cost,
+                current.tool_calls + 1, errors,
+            )):
+                raise InvalidUsage("outcome would overflow a 64-bit usage counter")
+            connection.execute(
+                """UPDATE runs SET tokens_used = tokens_used + ?,
+                   cost_cents = cost_cents + ?, tool_calls = tool_calls + 1,
+                   consecutive_errors = ?, last_heartbeat_at = ? WHERE id = ?""",
+                (tokens, cost, errors,
+                 max(current.last_heartbeat_at, event.created_at).isoformat(), event.run_id),
+            )
+            self._append_event(connection, event)
+
+    def touch_heartbeat(self, run_id: str, now: datetime) -> None:
+        with self._transaction() as connection:
+            current = self._get_run(connection, run_id)
+            connection.execute(
+                "UPDATE runs SET last_heartbeat_at = ? WHERE id = ?",
+                (max(current.last_heartbeat_at, now).isoformat(), run_id),
+            )
+
+    def record_state_change(
+        self, run: Run, transition: Transition, *, expected_heartbeat: datetime | None = None,
+    ) -> Run:
         """The only writer of `runs.state`, and it writes the audit row with it.
 
         `BEGIN IMMEDIATE` takes the write lock up front so the two statements
         commit or roll back together: spec §4 invariant 4 forbids a state change
         with no transition row, and two autocommit statements cannot promise that
         across a crash. Taking the lock immediately (rather than deferring to the
-        first write) also keeps two concurrent escalations from interleaving.
+        first write) serializes the revision check with the write. A transaction
+        without that check would still overwrite a newer state with an old one.
         """
-        with self._session() as connection:
-            connection.execute("BEGIN IMMEDIATE")
-            try:
-                connection.execute(
-                    "UPDATE runs SET state = ?, state_since = ? WHERE id = ?",
-                    (run.state.value, run.state_since.isoformat(), run.id),
-                )
-                connection.execute(
-                    """INSERT INTO transitions
-                       (run_id, from_state, to_state, cause, actor, detail, created_at)
-                       VALUES (?,?,?,?,?,?,?)""",
-                    (
-                        transition.run_id, transition.from_state.value,
-                        transition.to_state.value, transition.cause, transition.actor,
-                        transition.detail, transition.created_at.isoformat(),
-                    ),
-                )
-            except BaseException:
-                connection.execute("ROLLBACK")
-                raise
-            connection.execute("COMMIT")
+        if run.id != transition.run_id or run.state is not transition.to_state:
+            raise ValueError("state change and transition must describe the same run and target")
+        with self._transaction() as connection:
+            current = self._get_run(connection, run.id)
+            if (current.state_revision != run.state_revision
+                    or current.state is not transition.from_state):
+                raise ConcurrentStateChange(f"run {run.id} changed; re-read before transitioning")
+            if (expected_heartbeat is not None
+                    and current.last_heartbeat_at != expected_heartbeat):
+                raise ConcurrentStateChange(f"run {run.id} reported liveness after timeout selection")
+            connection.execute(
+                "UPDATE runs SET state = ?, state_since = ? WHERE id = ?",
+                (run.state.value, run.state_since.isoformat(), run.id),
+            )
+            connection.execute(
+                """INSERT INTO transitions
+                   (run_id, from_state, to_state, cause, actor, detail, created_at)
+                   VALUES (?,?,?,?,?,?,?)""",
+                (
+                    transition.run_id, transition.from_state.value,
+                    transition.to_state.value, transition.cause, transition.actor,
+                    transition.detail, transition.created_at.isoformat(),
+                ),
+            )
+            return self._get_run(connection, run.id)
+
+    def record_decision(self, event: Event, expected_revision: int) -> Decision:
+        if event.kind is not EventKind.DECISION:
+            raise ValueError("record_decision requires a DECISION event")
+        with self._transaction() as connection:
+            current = self._get_run(connection, event.run_id)
+            if current.state is RunState.TERMINATED:
+                raise RunTerminated(event.run_id)
+            decision = Decision(event.payload["decision"])
+            if current.state is RunState.FROZEN:
+                decision = Decision.FREEZE
+            elif decision is Decision.ALLOW and current.state_revision != expected_revision:
+                decision = Decision.DENY
+            self._append_event(connection, replace(event, payload={
+                **event.payload, "decision": decision.value,
+                "state_revision": current.state_revision,
+            }))
+            return decision
 
     def get_run(self, run_id: str) -> Run:
         with self._session() as connection:
-            row = connection.execute("SELECT * FROM runs WHERE id = ?", (run_id,)).fetchone()
-        if row is None:
-            raise UnknownRun(run_id)
-        return _row_to_run(row)
+            return self._get_run(connection, run_id)
 
     def list_runs(self, state: RunState | None = None) -> Sequence[Run]:
-        query, params = "SELECT * FROM runs", ()
+        query, params = RUN_SELECT, ()
         if state is not None:
             query, params = query + " WHERE state = ?", (state.value,)
         with self._session() as connection:
             rows = connection.execute(query + " ORDER BY created_at", params).fetchall()
         return [_row_to_run(row) for row in rows]
 
-    def append_event(self, event: Event) -> None:
+    def append_event(self, event: Event) -> int:
         """Append one trajectory row, allocating `seq` inside the INSERT.
 
         `SELECT COALESCE(MAX(seq),0)+1` as part of the insert makes allocation and
@@ -213,18 +302,38 @@ class SqliteRepository:
         flight. `event.seq` is consequently advisory and is ignored here.
         """
         with self._session() as connection:
-            connection.execute(
-                """INSERT INTO events
-                   (run_id, seq, kind, created_at, tool_name, args_digest, payload)
-                   SELECT ?, COALESCE(MAX(seq), 0) + 1, ?, ?, ?, ?, ?
-                     FROM events WHERE run_id = ?""",
-                (
-                    event.run_id, event.kind.value,
-                    event.created_at.isoformat(), event.tool_name, event.args_digest,
-                    json.dumps(event.payload, default=str),
-                    event.run_id,
-                ),
-            )
+            return self._append_event(connection, event)
+
+    def _append_event(self, connection, event: Event) -> int:
+        cursor = connection.execute(
+            """INSERT INTO events
+               (run_id, seq, kind, created_at, tool_name, args_digest, payload)
+               SELECT ?, COALESCE(MAX(seq), 0) + 1, ?, ?, ?, ?, ?
+                 FROM events WHERE run_id = ?""",
+            (
+                event.run_id, event.kind.value,
+                event.created_at.isoformat(), event.tool_name, event.args_digest,
+                json.dumps(event.payload, default=str),
+                event.run_id,
+            ),
+        )
+        # This rowid belongs to this INSERT, even if another connection appends
+        # before the read. No dependency on newer SQLite RETURNING syntax.
+        return connection.execute(
+            "SELECT seq FROM events WHERE rowid = ?", (cursor.lastrowid,),
+        ).fetchone()["seq"]
+
+    def count_proposals(self, run_id: str, through_seq: int, tools: Sequence[str]) -> int:
+        if not tools:
+            return 0
+        placeholders = ",".join("?" for _ in tools)
+        with self._session() as connection:
+            row = connection.execute(
+                f"""SELECT COUNT(*) AS count FROM events WHERE run_id = ?
+                    AND kind = ? AND seq <= ? AND tool_name IN ({placeholders})""",
+                (run_id, EventKind.PROPOSED.value, through_seq, *tools),
+            ).fetchone()
+        return row["count"]
 
     def recent_events(self, run_id: str, limit: int) -> Sequence[Event]:
         with self._session() as connection:
@@ -265,7 +374,7 @@ class SqliteRepository:
     def runs_with_stale_heartbeat(self, cutoff: datetime) -> Sequence[Run]:
         with self._session() as connection:
             rows = connection.execute(
-                "SELECT * FROM runs WHERE last_heartbeat_at < ? AND state != ?",
+                RUN_SELECT + " WHERE last_heartbeat_at < ? AND state != ?",
                 (cutoff.isoformat(), RunState.TERMINATED.value),
             ).fetchall()
         return [_row_to_run(row) for row in rows]
@@ -286,6 +395,7 @@ def _row_to_run(row) -> Run:
         cost_cents=row["cost_cents"],
         tool_calls=row["tool_calls"],
         consecutive_errors=row["consecutive_errors"],
+        state_revision=row["state_revision"],
     )
 
 

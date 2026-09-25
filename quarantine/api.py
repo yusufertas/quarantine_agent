@@ -13,33 +13,37 @@ a FROZEN run is the operation that must never become automatic (ADR-0002).
 # authenticating. A lint-driven consistency pass adding it here breaks the
 # operator surface silently; tests/test_operator_surface.py is the tripwire.
 from collections.abc import Callable
-from dataclasses import replace
 from datetime import timedelta
 from typing import Annotated
 from uuid import uuid4
 
 from fastapi import Depends, FastAPI, Header, HTTPException
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from .domain import machine
 from .domain.models import Event, Run, ToolCall, Transition
 from .domain.states import EventKind, RunState
 from .errors import (
     AuthorizationRequired,
+    ConcurrentStateChange,
+    InvalidUsage,
     IllegalTransition,
     RunTerminated,
     StoreUnavailable,
     UnknownRun,
 )
 from .gate import Gate
+from .store import MAX_COUNTER
+
+Usage = Annotated[int, Field(strict=True, ge=0, le=MAX_COUNTER)]
 
 
 class RegisterRun(BaseModel):
     agent_name: str
-    budget_tokens: int
-    budget_cost_cents: int
-    deadline_seconds: int
+    budget_tokens: Usage
+    budget_cost_cents: Usage
+    deadline_seconds: Annotated[int, Field(strict=True, gt=0, le=MAX_COUNTER)]
 
 
 class GateRequest(BaseModel):
@@ -51,8 +55,8 @@ class GateRequest(BaseModel):
 class OutcomeRequest(BaseModel):
     tool_name: str
     ok: bool
-    tokens: int = 0
-    cost_cents: int = 0
+    tokens: Usage = 0
+    cost_cents: Usage = 0
 
 
 class ReleaseRequest(BaseModel):
@@ -143,6 +147,14 @@ def create_app(
     def _unauthorized(_, exc):
         return JSONResponse(status_code=403, content={"detail": str(exc)})
 
+    @app.exception_handler(ConcurrentStateChange)
+    def _conflict(_, exc):
+        return JSONResponse(status_code=409, content={"detail": str(exc)})
+
+    @app.exception_handler(InvalidUsage)
+    def _invalid_usage(_, exc):
+        return JSONResponse(status_code=422, content={"detail": str(exc)})
+
     # 503 rather than the 500 an unhandled exception would produce: spec §9 makes
     # a store outage a tiering event, and the SDK can only tier client-side on a
     # status that says "the control plane cannot decide right now" rather than
@@ -174,6 +186,10 @@ def create_app(
     @app.post("/runs", status_code=201)
     def register(body: RegisterRun) -> dict:
         now = clock.now()
+        try:
+            deadline_at = now + timedelta(seconds=body.deadline_seconds)
+        except OverflowError:
+            raise HTTPException(status_code=422, detail="deadline_seconds exceeds datetime range") from None
         run = Run(
             id=str(uuid4()),
             agent_name=body.agent_name,
@@ -183,7 +199,7 @@ def create_app(
             last_heartbeat_at=now,
             budget_tokens=body.budget_tokens,
             budget_cost_cents=body.budget_cost_cents,
-            deadline_at=now + timedelta(seconds=body.deadline_seconds),
+            deadline_at=deadline_at,
         )
         store.create_run(run)
         return {"id": run.id}
@@ -202,30 +218,12 @@ def create_app(
 
     @app.post("/runs/{run_id}/outcome")
     def outcome(run_id: str, body: OutcomeRequest) -> dict:
-        """Record a tool result and advance the run's counters.
-
-        This is a read-modify-write of a snapshot, and deliberately safe as one:
-        `save_run` cannot write `state`, so an escalation landing between the read
-        and the write survives untouched. Before that constraint existed, a report
-        arriving a millisecond after a freeze wrote the pre-freeze state back and
-        un-contained the run while its transition row stayed on the record.
-        """
-        run = store.get_run(run_id)
+        """Record usage deltas and their audit event as one atomic operation."""
         now = clock.now()
-        store.save_run(
-            replace(
-                run,
-                tokens_used=run.tokens_used + body.tokens,
-                cost_cents=run.cost_cents + body.cost_cents,
-                tool_calls=run.tool_calls + 1,
-                consecutive_errors=0 if body.ok else run.consecutive_errors + 1,
-                last_heartbeat_at=now,
-            )
-        )
-        store.append_event(
+        store.record_outcome(
             Event(
                 run_id=run_id,
-                seq=store.next_seq(run_id),
+                seq=0,
                 kind=EventKind.OUTCOME,
                 created_at=now,
                 tool_name=body.tool_name,
@@ -240,13 +238,8 @@ def create_app(
 
     @app.post("/runs/{run_id}/heartbeat")
     def heartbeat(run_id: str) -> dict:
-        """Mark the worker alive. Liveness only -- never a state change.
-
-        Same property as `outcome`: `save_run` carries no `state`, so a heartbeat
-        cannot resurrect a run the machine has since contained.
-        """
-        run = store.get_run(run_id)
-        store.save_run(replace(run, last_heartbeat_at=clock.now()))
+        """Mark liveness without writing counters from a potentially stale read."""
+        store.touch_heartbeat(run_id, clock.now())
         return {"ok": True}
 
     @app.post("/runs/{run_id}/complete")

@@ -86,6 +86,28 @@ Ladder order: `HEALTHY < DEGRADED < FROZEN < TERMINATED`.
 
 `POST /runs/{id}/gate` with a proposed `ToolCall`.
 
+### Concurrent decisions (2026-09-19 clarification)
+
+The algorithm below describes one logical request, not a lock held across model
+I/O. Repository state writes compare the snapshot's opaque `state_revision` and
+source state inside the same transaction as the transition. A stale snapshot is
+rejected even after a same-time state cycle. The SQLite revision is the latest
+transition ID for that run; existing database tables need no column migration.
+
+Every returned decision is revalidated and appended atomically: current
+`TERMINATED` raises, current `FROZEN` returns `FREEZE`, and an `ALLOW` based on a
+changed revision becomes `DENY`. A stale background verdict remains in the audit
+trail but cannot overwrite newer state. Conflicting operator/complete requests
+return `409` and require a fresh read. No automatic release or retry is implied.
+
+Outcome deltas, consecutive errors, liveness and the outcome event commit
+together. Heartbeats change only liveness. A reaper transition also requires the
+selected heartbeat to be unchanged at commit, so a fresh heartbeat or outcome
+cannot be overwritten by a timeout selected earlier.
+
+This does not make authorization and external tool execution one transaction,
+reserve budgets, or provide hostile-worker isolation.
+
 ```
 run = store.get(run_id)                      # missing        -> 404
 if run.state is TERMINATED:                  #                -> 409
@@ -202,10 +224,15 @@ class Judge(Protocol):
 `Verdict` carries `severity` (`CLEAR` < `CONCERN` < `SEVERE`) and a `reason` string shown
 to operators on the inspection page. It reads the last `K=20` events (configurable).
 
-- `HIGH`-risk calls block on it, with a timeout; exceeding the timeout raises
-  `JudgeUnavailable`.
-- `LOW`-risk trajectories are judged out of band every `J=10` gate calls; the verdict
-  applies from the next gate call.
+- `HIGH`-risk calls block on it, with per-request transport timeouts and SDK retries
+  disabled; a timeout raises `JudgeUnavailable`. This is not a hard end-to-end
+  wall-clock deadline.
+- `LOW`-risk trajectories are judged out of band on every `J=10` LOW proposal
+  reaching the scheduling step. Its ordinal counts LOW proposals up to that
+  proposal's allocated sequence, not total log rows. HIGH proposals and unrelated
+  telemetry never shift it; HIGH calls are not additionally queued for judging.
+  The result affects subsequent decisions, including one still in flight when
+  the result commits. Scheduling/delivery is not a durable job queue.
 - A `CONCERN` or `SEVERE` verdict escalates one rung — binding, identical to a rule firing.
 - Every invocation appends a `JUDGE` event, including failures. Judge errors are never
   swallowed.

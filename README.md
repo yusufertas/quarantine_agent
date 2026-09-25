@@ -2,11 +2,13 @@
 
 **A kill switch for LLM agents that doesn't destroy the evidence.**
 
-> **Status: contract suite green; runnable.** The design is settled and all 253 tests
-> pass — the domain, the gate, the judge tiering, the reaper, the HTTP surface, persistence
+> **Status: runnable cooperative control plane, not a process sandbox.** The domain,
+> the gate, the judge tiering, the reaper, the HTTP surface, persistence
 > (`SqliteRepository`, `Settings.from_env`), and the worker SDK are all implemented against
 > the spec-first contract. See [Project status](#project-status) and
-> [Using it from an agent](#using-it-from-an-agent) to onboard a worker.
+> [Using it from an agent](#using-it-from-an-agent) to onboard a worker. The
+> [integrity audit](docs/audits/2026-09-19-control-plane-integrity.md) records
+> reproduced defects, regression controls and remaining limitations.
 
 ---
 
@@ -85,8 +87,8 @@ registry quietly rots into a permit-list for anything new.
 The worker SDK (`quarantine.sdk.QuarantineClient`) is the thing an agent developer
 actually imports. It wraps the HTTP protocol above — gate before, report after,
 heartbeat throughout — so a worker doesn't hand-roll it. It is **not** a trust
-boundary: nothing in it is relied on for a safety property, and every guarantee
-above holds even if a worker skips it entirely. What it must get right is the
+boundary: server decisions are enforced on requests that reach the gate, but a
+worker that bypasses the protocol can still act. What the SDK must get right is the
 client-side half of the fail-open/fail-closed tiering, because that's the
 behaviour that applies exactly when it can't reach the control plane at all.
 
@@ -176,6 +178,18 @@ the agent is done so the run leaves the ladder cleanly:
 client.complete()
 ```
 
+`gate()` and `guard()` accept an optional keyword-only `args_preview` for the
+judge. Supply a short, explicitly redacted description of the proposed action,
+never credentials, private reasoning or raw sensitive arguments. The preview is
+stored and sent to the configured model; it is not automatically sanitized.
+The digest identifies arguments but cannot tell the judge what those arguments
+mean. Omitting the preview preserves existing SDK call signatures and behavior.
+
+Usage and budgets are non-negative, signed-64-bit JSON integers (not booleans or
+numeric strings). Deadlines must be positive and fit the server's datetime range.
+Invalid input or accumulated usage overflow returns `422` without a partial
+outcome write. Zero budgets remain valid.
+
 `heartbeat()`, `complete()`, and the outcome report inside `guard()` are all
 best-effort: if the control plane is unreachable or answers with an error they
 swallow it rather than crashing the agent on telemetry. An outage is
@@ -195,15 +209,23 @@ still sees it.
 - **We gate tool calls; we don't sandbox the process.** An agent that bypasses its own tool
   layer and touches the filesystem directly is outside what this sees.
 - **Single box.** No multi-tenancy, no HA. Internal tool.
+- **An authorization is a point-in-time decision, not a reservation.** The server
+  checks current containment while committing the decision event. An operator
+  action after that commit cannot revoke an already delivered `ALLOW` or stop a
+  running tool. Concurrent calls do not reserve future budget.
+- **No worker authentication.** Run IDs identify runs; they are not credentials.
+  Keep the service on a trusted network. Operator-token checks are a separate
+  boundary and do not authenticate worker endpoints.
 
 ## Project status
 
 The design is documented, the decisions behind it are recorded, and the contract is
-encoded as a test suite. All 253 tests pass — 147 of them the spec-first contract, written
-before any implementation existed, so building against them couldn't quietly redefine what
-the system is supposed to do — the domain model, the gate, the LLM judge tiering, the
+encoded as a test suite, including 147 spec-first contract tests written before
+implementation. The domain model, the gate, the LLM judge tiering, the
 heartbeat reaper, the HTTP surface (both the worker protocol and the human-only operator
-endpoints), persistence, and the worker SDK are all implemented and green.
+endpoints), persistence, and the worker SDK are implemented. See the audit for
+exact tested versions and results, including the intermittent SQLite contention
+failure; a passing run is not a guarantee that concurrent appends never time out.
 
 Three things noted so nobody mistakes them for oversights:
 
@@ -256,7 +278,19 @@ and the judge's verdict is binding.
 | `tests/test_storage_concurrency.py` | Concurrent writers against real SQLite: a containment survives an in-flight counter write, and concurrent appends do not collide |
 | `tests/test_store_unavailable.py` | Spec §9's storage row on both halves: `503` from the API, client-side tiering in the SDK |
 | `tests/test_operator_surface.py` | All five human-only routes reject an unauthenticated caller; release defaults |
+| `tests/test_integrity_regressions.py` | Invalid usage, atomic outcomes, delayed judges, stale state and heartbeat writes |
+| `tests/test_background_cadence.py` | Exact LOW proposal ordinals independent of telemetry and callback timing; no duplicate HIGH judging |
+| `tests/test_concurrency_review.py` | Reaper liveness races, operator conflicts, ABA, decision transactions and legacy databases |
+| `tests/test_judge_sdk_regressions.py` | Explicit retry bound, argument identity, optional preview and preserved refusal/tiering |
+| `tests/test_assembled_system.py` | SDK, HTTP, gate, SQLite and reaper together; persistence across a reopen |
+| `tests/test_background_judge.py` | Queued judging, exact cadence, outages and stale evaluation-time verdicts on both repositories |
+| `tests/test_api_errors.py` | 404/409/422 behavior and audit effects; one strict expected failure for a body-less terminate request |
+| `tests/test_repository_contract.py` | Shared fake/SQLite contract, stale snapshots, known fake divergences, WAL and foreign keys |
+| `tests/test_entrypoint.py` | Production factory, environment, operator-token refusal, clock and judge/scheduler wiring without model calls |
+| `tests/test_rule_boundaries.py` | Detector thresholds, time-window edges and precedence |
+| `tests/test_judge_request.py` | Request model/schema, retry and timeout options, trajectory order and error translation |
+| `tests/test_vocabulary.py` | State/severity ordering, escalation table, release targets and actor prefixes |
 
 ## Stack
 
-Python 3.14 · FastAPI · SQLite (WAL) behind a repository interface · pytest
+Python >=3.12 (package requirement) · FastAPI · SQLite (WAL) behind a repository interface · pytest

@@ -77,9 +77,16 @@ class QuarantineClient:
         self._run_id = run_id
         self._transport = transport
 
-    def guard(self, tool_name: str, args_digest: str, action: Callable[[], Any]) -> Any:
+    def guard(
+        self,
+        tool_name: str,
+        args_digest: str,
+        action: Callable[[], Any],
+        *,
+        args_preview: str = "",
+    ) -> Any:
         """Gate a tool call, run it if permitted, and report the outcome."""
-        decision = self.gate(tool_name, args_digest)
+        decision = self.gate(tool_name, args_digest, args_preview=args_preview)
         if decision is Decision.FREEZE:
             raise RunFrozen(f"run {self._run_id} is frozen")
         if decision is Decision.DENY:
@@ -93,10 +100,17 @@ class QuarantineClient:
         self.report(tool_name, ok=True)
         return result
 
-    def gate(self, tool_name: str, args_digest: str) -> Decision:
+    def gate(
+        self, tool_name: str, args_digest: str, *, args_preview: str = ""
+    ) -> Decision:
         try:
             response = self._post(
-                "gate", {"tool_name": tool_name, "args_digest": args_digest}
+                "gate",
+                {
+                    "tool_name": tool_name,
+                    "args_digest": args_digest,
+                    "args_preview": args_preview,
+                },
             )
         except ConnectionError:
             return self._offline_decision(tool_name)

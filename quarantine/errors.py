@@ -54,3 +54,11 @@ class StoreUnavailable(QuarantineError):
     unreachable control plane: `HIGH` blocked, `LOW` proceeds. A `500` would be
     indistinguishable from a bug and would crash the agent instead.
     """
+
+
+class ConcurrentStateChange(QuarantineError):
+    """The run changed after a decision's snapshot. Never overwrite that change."""
+
+
+class InvalidUsage(QuarantineError):
+    """Usage must be non-negative and fit the store's signed 64-bit counters."""

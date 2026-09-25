@@ -11,6 +11,7 @@ from __future__ import annotations
 
 from .config import Settings
 from .domain import machine
+from .errors import ConcurrentStateChange
 
 
 class Reaper:
@@ -45,7 +46,13 @@ class Reaper:
             updated, transition = machine.escalate(
                 run, cause="heartbeat_timeout", actor="system", now=now
             )
-            self._store.record_state_change(updated, transition)
+            try:
+                self._store.record_state_change(
+                    updated, transition, expected_heartbeat=run.last_heartbeat_at,
+                )
+            except ConcurrentStateChange:
+                # A newer containment/operator action wins; retry on a later sweep.
+                continue
             escalated += 1
 
         return escalated

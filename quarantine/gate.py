@@ -14,7 +14,7 @@ from .config import Settings
 from .domain import machine, registry, rules
 from .domain.models import Event, RuleContext, ToolCall
 from .domain.states import Decision, EventKind, RunState, Severity, ToolRisk
-from .errors import JudgeUnavailable, RunTerminated
+from .errors import ConcurrentStateChange, JudgeUnavailable, RunTerminated
 
 
 class Gate:
@@ -62,7 +62,7 @@ class Gate:
         # Snapshot the trajectory BEFORE recording this proposal, so the loop
         # rule sees the proposed call exactly once -- via ctx.call, not twice.
         history = tuple(self._store.recent_events(run_id, self._history_limit()))
-        self._append(
+        proposal_seq = self._append(
             run_id,
             EventKind.PROPOSED,
             now,
@@ -72,26 +72,33 @@ class Gate:
         )
 
         if run.state is RunState.FROZEN:
-            return self._record(run_id, now, call, Decision.FREEZE)
+            return self._record(run, now, call, Decision.FREEZE)
 
-        run = self._apply_rules(run, call, history, now)
+        try:
+            run = self._apply_rules(run, call, history, now)
+        except ConcurrentStateChange:
+            return self._record(run, now, call, Decision.DENY)
 
         if run.state is RunState.FROZEN:
-            return self._record(run_id, now, call, Decision.FREEZE)
+            return self._record(run, now, call, Decision.FREEZE)
 
         risk = registry.risk_of(call.tool_name)
 
         # The answer here cannot change, so paying the judge for it is waste.
         if run.state is RunState.DEGRADED and risk is ToolRisk.HIGH:
-            return self._record(run_id, now, call, Decision.DENY)
+            return self._record(run, now, call, Decision.DENY)
 
         if risk is ToolRisk.HIGH:
-            decision = self._consult_judge(run, run_id, call, now)
+            try:
+                decision = self._consult_judge(run, run_id, call, now)
+            except ConcurrentStateChange:
+                return self._record(run, now, call, Decision.DENY)
             if decision is not None:
                 return decision
 
-        self._maybe_judge_in_background(run_id)
-        return self._record(run_id, now, call, Decision.ALLOW)
+        if risk is ToolRisk.LOW:
+            self._maybe_judge_in_background(run_id, proposal_seq)
+        return self._record(run, now, call, Decision.ALLOW)
 
     def _apply_rules(self, run, call, history, now):
         """Escalate on a firing rule, else auto-recover if the interval has elapsed."""
@@ -129,7 +136,7 @@ class Gate:
             self._append(
                 run_id, EventKind.JUDGE, now, payload={"available": False, "error": str(exc)}
             )
-            return self._record(run_id, now, call, Decision.DENY)   # fail closed
+            return self._record(run, now, call, Decision.DENY)   # fail closed
 
         self._append(
             run_id,
@@ -138,14 +145,14 @@ class Gate:
             payload={"severity": verdict.severity.value, "reason": verdict.reason},
         )
         if verdict.severity >= Severity.CONCERN:
-            self._transition(
+            run = self._transition(
                 machine.escalate(
                     run, cause="judge", actor="system", now=now, detail=verdict.reason
                 )
             )
             # Only reachable from HEALTHY, so the run is now DEGRADED and this
             # HIGH-risk call is refused. A FREEZE here would be unreachable code.
-            return self._record(run_id, now, call, Decision.DENY)
+            return self._record(run, now, call, Decision.DENY)
         return None
 
     def _transition(self, outcome):
@@ -153,19 +160,19 @@ class Gate:
         # or not at all, and nothing here can write a counter back from a stale
         # snapshot (spec §4, invariant 4).
         run, transition = outcome
-        self._store.record_state_change(run, transition)
-        return run
+        return self._store.record_state_change(run, transition)
 
-    def _record(self, run_id, now, call, decision: Decision) -> Decision:
-        self._append(
-            run_id,
-            EventKind.DECISION,
-            now,
-            tool_name=call.tool_name,
-            args_digest=call.args_digest,
-            payload={"decision": decision.value},
+    def _record(self, run, now, call, decision: Decision) -> Decision:
+        # Authorization linearizes with its audit append, not with the read that
+        # preceded a potentially slow judge. No network call holds a DB lock.
+        return self._store.record_decision(
+            Event(
+                run_id=run.id, seq=0, kind=EventKind.DECISION,
+                created_at=now, tool_name=call.tool_name, args_digest=call.args_digest,
+                payload={"decision": decision.value},
+            ),
+            expected_revision=run.state_revision,
         )
-        return decision
 
     def _append(
         self,
@@ -176,8 +183,8 @@ class Gate:
         tool_name: str | None = None,
         args_digest: str | None = None,
         payload: dict | None = None,
-    ) -> None:
-        self._store.append_event(
+    ) -> int:
+        return self._store.append_event(
             Event(
                 run_id=run_id,
                 seq=self._store.next_seq(run_id),
@@ -213,8 +220,8 @@ class Gate:
             self._EVENTS_PER_CALL * (s.call_rate_per_minute + 1),
         )
 
-    def _maybe_judge_in_background(self, run_id: str) -> None:
-        """Queue out-of-band judging every `judge_background_every` gate calls.
+    def _maybe_judge_in_background(self, run_id: str, proposal_seq: int) -> None:
+        """Queue judging on every Jth LOW proposal, independent of audit traffic.
 
         With no scheduler injected there is no background judging -- which is
         why the LOW-risk path in tests performs no I/O at all. The API wires a
@@ -222,7 +229,10 @@ class Gate:
         """
         if self._background is None:
             return
-        if self._store.next_seq(run_id) % self._settings.judge_background_every != 0:
+        low_tools = tuple(name for name, risk in registry.TOOL_RISKS.items()
+                          if risk is ToolRisk.LOW)
+        ordinal = self._store.count_proposals(run_id, proposal_seq, low_tools)
+        if ordinal % self._settings.judge_background_every != 0:
             return
         self._background(lambda: self._judge_now(run_id))
 
@@ -246,8 +256,12 @@ class Gate:
             payload={"severity": verdict.severity.value, "reason": verdict.reason},
         )
         if verdict.severity >= Severity.CONCERN and run.state in machine.ESCALATIONS:
-            self._transition(
-                machine.escalate(
-                    run, cause="judge", actor="system", now=now, detail=verdict.reason
+            try:
+                self._transition(
+                    machine.escalate(
+                        run, cause="judge", actor="system", now=now, detail=verdict.reason
+                    )
                 )
-            )
+            except ConcurrentStateChange:
+                self._append(run_id, EventKind.SYSTEM, now,
+                             payload={"reason": "stale_judge_verdict_discarded"})
